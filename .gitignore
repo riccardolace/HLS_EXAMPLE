@@ -22,3 +22,7 @@ vivado/proj/
 # Istruzioni di lavoro per Claude Code: metodo e contesto della sessione,
 # non contenuto del tutorial. Resta sul disco locale, non va su GitHub.
 CLAUDE.md
+
+# Impostazioni locali di Claude Code (permessi della sessione): sono
+# specifiche di questa macchina, non fanno parte del tutorial.
+.claude/
