@@ -166,3 +166,79 @@ Altri due dettagli del report:
 
 Risorse usate: **4 FF, 12 LUT, 0 DSP, 0 BRAM**. Un pass-through è essenzialmente
 due register slice AXI.
+
+### La cosimulation: la prima volta che l'hardware viene eseguito
+
+Al gradino 1.1 abbiamo lanciato anche la **C/RTL Cosimulation**, che nel piano
+sarebbe una fase successiva. Vale la pena registrare cosa aggiunge, perché
+completa il quadro dei tre passi:
+
+| Passo | Dove gira | Cosa verifica | Cosa **non** vede |
+|---|---|---|---|
+| C Simulation | sul PC, con clang | l'**algoritmo** | tempo, clock, handshake, interfacce |
+| C Synthesis | non esegue nulla | traduce C → RTL e **stima** | se funzioni davvero |
+| C/RTL Cosimulation | simulatore (xsim) | l'**RTL vero**, con clock e protocollo | — |
+
+Il punto da fissare: **la sintesi non verifica niente.** È un traduttore con un
+preventivo allegato. Se un pragma di interfaccia è sbagliato, `csynth` passa lo
+stesso e produce numeri ottimi su un circuito che in un sistema vero si pianta.
+La cosim è il primo momento in cui qualcuno *esegue* il tuo hardware: riprende
+`axis_scaler_tb.cpp`, ne registra gli stimoli, li applica all'RTL nel simulatore
+e confronta le uscite. Ecco perché il testbench deve essere auto-verificante —
+l'esito della cosim **è** il valore di ritorno del tuo `main()`.
+
+Il report (`sim/report/axis_scaler_cosim.rpt`):
+
+```text
+|   RTL    | Status |  Latency: min 2 | avg 10 | max 18 |  Total Execution: 28
+|   Verilog|  Pass  |
+|      VHDL|    NA  |
+```
+
+**Attenzione alla riga `VHDL: NA`: la cosim ha simulato il Verilog, non il VHDL.**
+È il default. HLS genera entrambi i linguaggi ma ne simula uno solo. Se vuoi che
+la simulazione giri esattamente sul file che stai leggendo, si imposta
+`cosim.rtl=vhdl` in `hls_config.cfg`.
+
+Il report più istruttivo è però `sim/report/verilog/result.transaction.rpt`:
+
+```text
+                    latency     interval
+transaction 0:            2            1
+transaction 1:           10            9
+transaction 2:           18            x
+```
+
+**Quelle tre transazioni sono i tre pacchetti del testbench**: 1, 8 e 17
+campioni. Qui si vede il legame diretto fra una riga di C e i cicli di clock
+consumati dall'hardware: `prova_pacchetto(17)` costa 18 cicli.
+
+Ed è qui che i due report si completano a vicenda: la sintesi scriveva `?` alla
+voce *Latency*, perché non può sapere quanto è lungo un pacchetto deciso da
+`TLAST` a runtime. La cosim quel numero lo **misura**, perché i pacchetti veri
+glieli abbiamo dati noi.
+
+> **Una domanda lasciata aperta.** Il modello "N campioni → N+1 cicli" torna per
+> il primo pacchetto (1→2) e per il terzo (17→18), **ma non per il secondo**
+> (8→10, non 9). C'è un ciclo di bolla che i report non spiegano. Non inventiamo
+> una spiegazione: è esattamente il tipo di domanda a cui si risponde guardando
+> le waveform, e lo riprenderemo in Fase 3.
+
+### Perché non si vedono ancora le waveform
+
+Dopo la cosim non esiste **nessun file di waveform**: gli unici `.wcfg` presenti
+sono template di configurazione (quali segnali mostrare), non dati registrati.
+
+Il motivo è che in `hls_config.cfg` non c'è **nessuna chiave `cosim.*`**, quindi
+valgono tutti i default — e il default non traccia niente. Per ottenerle servono:
+
+```ini
+cosim.wave_debug=1        # apre il visualizzatore
+cosim.trace_level=all     # traccia tutti i segnali
+```
+
+Non le attiviamo adesso di proposito: rallentano la simulazione e sono il cuore
+della Fase 3, dove aggiungeremo anche `cosim.random_stall=1` per stressare la
+backpressure e vedere la IP fermarsi davvero. (Allo stato attuale lo stall è a
+`delay == 0` su tutte le porte, cioè disattivato: i numeri qui sopra sono
+"puliti", senza ritardi artificiali.)

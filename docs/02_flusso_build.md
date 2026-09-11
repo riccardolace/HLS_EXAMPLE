@@ -147,6 +147,19 @@ Dopo `make csynth`, dentro `workspace/axis_scaler/axis_scaler/hls/`:
 | `impl/ip/` | l'IP impacchettata: `component.xml`, HDL, **e i driver C** |
 | `impl/ip/drivers/*/src/*_hw.h` | **la mappa registri generata** — la sorgente di verità, mai copiarla a mano |
 
+Dopo `make cosim` si aggiunge la cartella `sim/`:
+
+| Percorso | Contenuto |
+|---|---|
+| `sim/report/axis_scaler_cosim.rpt` | esito (`Pass`/`Fail`) e latenze min/avg/max misurate |
+| `sim/report/verilog/result.transaction.rpt` | **latenza di ogni singola transazione** — una riga per chiamata della top function nel testbench |
+| `sim/report/verilog/lat.rpt` | gli stessi numeri in forma di variabili, comodi da parsare |
+| `sim/verilog/` | il testbench RTL generato e i file del simulatore |
+| `sim/tv/` | i *test vector*: gli stimoli registrati dalla simulazione C e riapplicati all'RTL |
+| `sim/axis_scaler_cosim_random_stall.json` | la configurazione degli stalli (di default `delay == 0`, cioè disattivati) |
+
 Che HLS generi anche il **VHDL**, non solo il Verilog, è una fortuna per chi
 viene da lì: la entity generata è perfettamente leggibile e si presta a essere
-confrontata gradino per gradino con quello che abbiamo scritto in C.
+confrontata gradino per gradino con quello che abbiamo scritto in C. Occhio però:
+**la cosim di default simula il Verilog**, non il VHDL (nel report la riga `VHDL`
+dice `NA`). Per simulare il file che stai leggendo serve `cosim.rtl=vhdl`.
