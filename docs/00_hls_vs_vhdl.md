@@ -624,3 +624,214 @@ impl/misc/drivers/axis_scaler_v1_0/src/xaxis_scaler_hw.h
 Accanto ci sono già anche `xaxis_scaler.h` / `.c` (il driver bare-metal) e
 `xaxis_scaler_linux.c`. Li leggeremo in Fase 4, quando la mappa registri sarà
 completa.
+
+---
+
+## 6. Cosa abbiamo osservato al gradino 1.3
+
+Modifica: **un argomento e un pragma**.
+
+```diff
+  void axis_scaler(hls::stream<pkt_t> &s_axis,
+-                  hls::stream<pkt_t> &m_axis);
++                  hls::stream<pkt_t> &m_axis,
++                  int                 gain);
+
++ #pragma HLS INTERFACE mode=s_axilite port=gain bundle=ctrl
+
+- // pass-through
++ campione.data = campione.data * gain;
+```
+
+È il primo gradino in cui il codice C produce **aritmetica**, non solo fili e
+handshake. E il primo in cui cambia la firma della funzione.
+
+### Il registro è nato a 0x10 — e non l'abbiamo deciso noi
+
+`xaxis_scaler_hw.h`, generato:
+
+```c
+// 0x10 : Data signal of gain
+//        bit 31~0 - gain[31:0] (Read/Write)
+// 0x14 : reserved
+
+#define XAXIS_SCALER_CTRL_ADDR_GAIN_DATA 0x10
+#define XAXIS_SCALER_CTRL_BITS_GAIN_DATA 32
+```
+
+Da nessuna parte, nel nostro codice, è scritto `0x10`. L'offset lo ha scelto
+HLS in base a due regole:
+
+1. gli offset `0x00`–`0x0C` sono riservati al blocco di controllo standard AMD
+   (`CTRL`/`GIER`/`IER`/`ISR`), quindi i registri utente partono da `0x10`;
+2. a parità di tutto il resto, conta **l'ordine degli argomenti della funzione
+   C**: il primo scalare mappato su `s_axilite` prende il primo offset libero.
+
+> **L'ordine degli argomenti C *è* la mappa registri.**
+> Scambiare due argomenti scambia due indirizzi. Il codice compila, l'IP parte,
+> e il driver software scrive nel registro sbagliato — un bug che non dà
+> nessun segnale, perché formalmente non c'è niente di illegale.
+
+Da qui due regole di progetto, che valgono da adesso in poi:
+
+- l'ordine degli argomenti si **congela** e si documenta;
+- gli offset **non si scrivono a mano**: si leggono da `xaxis_scaler_hw.h`.
+
+Nota il `0x14 : reserved`. Nel VHDL generato quello slot ha già un nome:
+
+```vhdl
+constant ADDR_GAIN_DATA_0 : INTEGER := 16#10#;
+constant ADDR_GAIN_CTRL   : INTEGER := 16#14#;
+```
+
+Per un ingresso resta inutilizzato. Al gradino 1.4, con il primo registro di
+**stato**, uno slot `_CTRL` come questo ospiterà il bit `_ap_vld`.
+
+### La entity: nessun pin nuovo, ma lo spazio indirizzi raddoppia
+
+```diff
+ entity axis_scaler is
+ generic (
+-    C_S_AXI_CTRL_ADDR_WIDTH : INTEGER := 4;
++    C_S_AXI_CTRL_ADDR_WIDTH : INTEGER := 5;
+     C_S_AXI_CTRL_DATA_WIDTH : INTEGER := 32 );
+```
+
+**È l'unica riga cambiata in tutta la entity.** Vale la pena fermarsi un
+momento: al gradino 1.2 avevamo previsto che questo numero sarebbe cresciuto, ed
+è cresciuto. 4 bit indirizzavano 16 byte (i quattro registri di controllo); con
+`gain` a `0x10` e il suo slot `_CTRL` a `0x14` servono più di 16 byte, quindi il
+bus passa a 5 bit = 32 byte.
+
+E soprattutto: **un registro di configurazione non aggiunge pin al modulo.**
+Aggiunge spazio di indirizzamento dentro un bus che c'era già. È la differenza
+pratica fra "parametro configurabile da software" e "porta hardware": in VHDL
+avresti dovuto scegliere fra un `generic` (fisso alla sintesi) e una porta in
+più (un altro fascio di fili da instradare). Qui la terza via — un registro —
+costa indirizzi, non piedini.
+
+Il log di sintesi lo riassume:
+
+```text
+INFO: [RTGEN 206-500] Setting interface mode on port 'axis_scaler/gain'
+                      to 's_axilite & ap_none'.
+INFO: [RTGEN 206-100] Bundling port 'gain' and 'return' to AXI-Lite port ctrl.
+```
+
+Stesso schema del gradino 1.2 (`s_axilite & ap_ctrl_hs`): `s_axilite` dice *da
+dove si raggiunge*, `ap_none` dice *che protocollo ha il segnale interno* —
+nessuno, è un valore stabile, senza handshake. Ed entrambi finiscono nello
+stesso `bundle=ctrl`, cioè nello stesso banco.
+
+### Il file nuovo: un moltiplicatore, con il nome che si spiega da solo
+
+In `syn/vhdl/` è comparso un quinto file:
+
+```text
+axis_scaler_mul_32s_32s_32_2_1.vhd
+                └─┬─┘ └─┬─┘ └┬┘ │ │
+                  │     │    │  │ └─ variante
+                  │     │    │  └─── 2 stadi di pipeline (2 cicli di latenza)
+                  │     │    └────── uscita a 32 bit
+                  │     └─────────── secondo operando: 32 bit signed
+                  └───────────────── primo operando:  32 bit signed
+```
+
+HLS non ha scritto `a * b` sperando che il sintetizzatore se la cavi: ha
+**istanziato un modulo dedicato**, dimensionato sugli operandi reali e
+pipelinato su 2 stadi per rientrare nel periodo di clock. È il tipo di scelta
+che in VHDL avresti dovuto fare tu, decidendo a mano quanti stadi di registri
+mettere e dove.
+
+Il modulo porta anche un attributo che vale la pena notare:
+
+```vhdl
+attribute keep_hierarchy of axis_scaler_mul_32s_32s_32_2_1: entity is "yes";
+```
+
+HLS chiede a Vivado di **non sciogliere questa gerarchia** durante la sintesi
+logica, per non perdere il mapping sui DSP che ha pianificato.
+
+### Il costo: ora c'è silicio vero
+
+| | DSP | FF | LUT | II | Iter. latency | Slack | Fmax |
+|---|---|---|---|---|---|---|---|
+| 1.2 | 0 | 40 | 52 | 1 | 2 | 0,761 ns | 1314 MHz |
+| 1.3 | **4** | **223** | **166** | **1** | **4** | **2,238 ns** | **447 MHz** |
+
+Il dettaglio per istanza dice dove sono finite le risorse:
+
+```text
+|        Instance       |       Module       | BRAM_18K| DSP| FF | LUT | URAM|
+|ctrl_s_axi_U           |ctrl_s_axi          |        0|   0|  74|  104|    0|
+|mul_32s_32s_32_2_1_U1  |mul_32s_32s_32_2_1  |        0|   4|  46|   42|    0|
+```
+
+Tre letture, in ordine di importanza.
+
+**a) Sono comparsi 4 DSP.** Una moltiplicazione 32×32 con segno non entra in un
+singolo DSP58: il tool la decompone in quattro moltiplicazioni parziali più le
+somme. È il primo gradino in cui il nostro C consuma una risorsa *aritmetica*
+dedicata e non solo logica generica.
+
+**b) Il banco registri è cresciuto**, da 36/40 a 74/104 FF/LUT: sono il registro
+`gain` a 32 bit e la logica di decodifica del suo indirizzo. Coerente:
+un registro in più costa circa 32 flip-flop più il contorno.
+
+**c) Il timing è peggiorato molto, e non è un problema.** Lo slack passa da
+0,761 ns a 2,238 ns, cioè la Fmax stimata crolla da 1314 a 447 MHz. La ragione è
+strutturale: al gradino 1.2 il banco registri stava **a lato** del percorso dati,
+mentre il moltiplicatore ci sta **in mezzo**. Ma 447 MHz sono comunque quasi il
+doppio dei 250 MHz che abbiamo chiesto, quindi il vincolo è rispettato con
+margine e il report dice `All loop constraints were satisfied`.
+
+**La cosa importante è che `II` è rimasto 1.** La *iteration latency* è
+raddoppiata (2 → 4 cicli: sono i due stadi del moltiplicatore che si aggiungono),
+ma continua a entrare un campione **ogni** ciclo. Latenza e throughput sono
+grandezze indipendenti: abbiamo allungato la catena di montaggio, non
+rallentato il nastro.
+
+### Il registro in VHDL: `wmask`, cioè i byte enable
+
+La logica di scrittura di `gain` nel banco registri:
+
+```vhdl
+if (w_hs = '1' and waddr = ADDR_GAIN_DATA_0) then
+    int_gain(31 downto 0) <= (UNSIGNED(WDATA(31 downto 0)) and wmask(31 downto 0))
+                          or ((not wmask(31 downto 0)) and int_gain(31 downto 0));
+end if;
+```
+
+`wmask` è costruito espandendo `WSTRB` a livello di bit. Tradotto: *i bit
+selezionati prendono il valore nuovo, gli altri conservano il vecchio*. È la
+gestione corretta delle scritture parziali — se il processore scrive un solo
+byte del registro, gli altri tre non vengono toccati. È il pezzo che si sbaglia
+quasi sempre scrivendo uno slave AXI4-Lite a mano.
+
+### Il testbench: il primo golden model vero
+
+Fino al 1.2 il risultato atteso era banalmente l'ingresso. Ora il testbench
+deve saper calcolare per conto proprio, e qui compare una regola di metodo che
+varrà per tutti i gradini successivi:
+
+> **Il golden model non deve assomigliare al DUT.**
+
+Scrivere nel testbench la stessa riga del sorgente sintetizzato non verifica
+nulla: se è sbagliata, è sbagliata identica nei due posti e il test passa. Nel
+nostro `tb/` il modello prende un'altra strada — aritmetica `long long` a 64 bit
+in C puro, poi troncamento esplicito ai 32 bit bassi — senza passare dai tipi
+`ap_int`. Se i due percorsi coincidono, il comportamento è quello che crediamo.
+
+Sette casi, su due dimensioni ortogonali: lunghezze del pacchetto (1, 8, 17) e
+valori del gain (1, 0, negativo, enorme). Due meritano una nota:
+
+- **`gain = 1`** è il caso identità: l'IP deve comportarsi esattamente come il
+  pass-through del gradino 1.2. È un controllo di non-regressione fra gradini.
+- **`gain = 100000000`** manda il prodotto fuori dai 32 bit. Non ci aspettiamo
+  un risultato matematicamente giusto: ci aspettiamo **esattamente i 32 bit
+  bassi**, che è ciò che l'hardware produce, ed è l'equivalente di
+  `y <= resize(x * gain, 32);` in VHDL.
+
+Quel test documenta il troncamento invece di evitarlo. Quando al gradino 1.8
+aggiungeremo la saturazione, **dovrà fallire** — e il fatto che fallisca sarà la
+prova che la saturazione funziona.

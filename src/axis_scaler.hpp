@@ -2,23 +2,25 @@
 //  axis_scaler.hpp  --  Tipi e dichiarazione dell'IP
 // =============================================================================
 //
-//  GRADINO 1.2 della costruzione incrementale.
+//  GRADINO 1.3 della costruzione incrementale.
 //
-//  QUESTO FILE NON E' CAMBIATO rispetto al gradino 1.1, ed e' un fatto che
-//  vale la pena notare: il gradino 1.2 aggiunge il banco registri AXI4-Lite
-//  di controllo, e la firma della funzione resta identica.
+//  LA NOVITA': il primo registro di CONFIGURAZIONE.
 //
-//  Il motivo e' che quel banco registri non trasporta DATI dell'algoritmo:
-//  contiene i segnali di controllo del blocco (ap_start, ap_done, ...), che
-//  in C non sono argomenti perche' sono impliciti nel concetto stesso di
-//  "chiamata di funzione". Il pragma s_axilite su "return" li rende
-//  raggiungibili da un bus, ma non aggiunge nulla da passare.
+//  Fino al gradino 1.2 questo file non era mai cambiato: la firma della
+//  funzione era sempre stata la stessa, perche' il banco registri AXI4-Lite
+//  conteneva solo i segnali di controllo del blocco (ap_start, ap_done, ...),
+//  che in C non sono argomenti.
 //
-//  Dal gradino 1.3, quando arriveranno i veri registri di configurazione,
-//  ogni nuovo registro sara' invece un nuovo argomento QUI.
+//  Ora cambia, ed e' il punto centrale del gradino:
 //
-//  La funzione resta un "pass-through": lo stream in ingresso viene copiato
-//  tale e quale sullo stream in uscita, senza elaborazione.
+//        UN REGISTRO DI CONFIGURAZIONE = UN ARGOMENTO DELLA FUNZIONE
+//
+//  Aggiungiamo "gain": un intero che il software scrive in un registro, e che
+//  l'IP usa per moltiplicare ogni campione. Da qui in avanti ogni registro
+//  nuovo sara' un argomento nuovo in questa riga.
+//
+//  Obiettivo del gradino: sintetizzare e scoprire DOVE finisce quel registro
+//  nella mappa degli indirizzi, e chi decide quel "dove".
 //
 // =============================================================================
 #ifndef AXIS_SCALER_HPP
@@ -121,7 +123,35 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 //  passassi per valore chiederesti al tool di duplicare una FIFO hardware, e
 //  infatti la sintesi si rifiuterebbe.
 //
+//  --------------------------------------------------------------------------
+//  IL NUOVO ARGOMENTO: gain
+//  --------------------------------------------------------------------------
+//  Al contrario degli stream, "gain" si passa PER VALORE (senza &). Anche
+//  questa non e' una scelta stilistica, dice una cosa precisa al tool:
+//
+//        per valore   -> e' un INGRESSO, letto una volta. Diventa un registro
+//                        di sola scrittura dal lato software.
+//        per puntatore o riferimento -> potrebbe essere anche un'USCITA, e il
+//                        tool deve generare la logica per scriverlo.
+//
+//  Il gradino 1.4 usera' proprio un puntatore per il primo registro di STATO,
+//  e li' si vedra' la differenza nell'RTL. Per ora: per valore = ingresso.
+//
+//  Perche' "int" e non ap_int<32>? Perche' un registro AXI4-Lite e' comunque
+//  largo 32 bit, e "int" e' il tipo che il driver software usera' dall'altro
+//  lato del bus. Tenere lo stesso tipo su entrambi i lati evita conversioni
+//  implicite di cui poi non ti ricordi. Al gradino 1.6 diventera' un
+//  ap_fixed<16,2>, e allora il discorso cambiera' radicalmente.
+//
+//  ORDINE DEGLI ARGOMENTI: non e' indifferente.
+//  L'ordine in cui compaiono qui determina l'ordine con cui HLS assegna gli
+//  OFFSET nella mappa registri. Cambiare l'ordine degli argomenti cambia gli
+//  indirizzi, e quindi rompe il driver software scritto per la versione
+//  precedente. Per questo l'ordine, una volta scelto, si congela.
+//  --------------------------------------------------------------------------
+//
 void axis_scaler(hls::stream<pkt_t> &s_axis,
-                 hls::stream<pkt_t> &m_axis);
+                 hls::stream<pkt_t> &m_axis,
+                 int                 gain);
 
 #endif // AXIS_SCALER_HPP
