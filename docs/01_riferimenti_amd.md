@@ -197,6 +197,12 @@ qui il metodo è vedere l'hardware prima della spiegazione.
 
 - [AXI4-Lite Interface](https://docs.amd.com/r/en-US/ug1399-vitis-hls/AXI4-Lite-Interface)
 - [Control Clock and Reset in AXI4-Lite Interfaces](https://docs.amd.com/r/en-US/ug1399-vitis-hls/Control-Clock-and-Reset-in-AXI4-Lite-Interfaces)
+  — **la pagina sui clock multipli**: contiene il vincolo "AXI4-Lite clock must
+  be synchronous to `ap_clk`, derived from the same master generator clock" e la
+  nota sulla CDC slice generata automaticamente da Vivado IP Integrator.
+  Commentata in `docs/00` §5, "Un solo `ap_clk` per tutto"
+- [Clock and Reset Ports](https://docs.amd.com/r/en-US/ug1399-vitis-hls/Clock-and-Reset-Ports)
+  — `ap_clk`, `ap_rst_n`, e l'opzione `syn.interface.clock_enable` per `ap_ce`
 - [Customizing AXI4-Lite Slave Interfaces in IP Integrator](https://docs.amd.com/r/en-US/ug1399-vitis-hls/Customizing-AXI4-Lite-Slave-Interfaces-in-IP-Integrator)
 </details>
 

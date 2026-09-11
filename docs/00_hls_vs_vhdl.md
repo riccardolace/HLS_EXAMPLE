@@ -625,6 +625,108 @@ Accanto ci sono già anche `xaxis_scaler.h` / `.c` (il driver bare-metal) e
 `xaxis_scaler_linux.c`. Li leggeremo in Fase 4, quando la mappa registri sarà
 completa.
 
+### Un solo `ap_clk` per tutto: e se volessi clock diversi?
+
+Guardando la entity si nota una cosa che vale la pena tenere a mente: **c'è un
+solo `ap_clk`**, e lo condividono il percorso dati (`s_axis`/`m_axis`) e il bus
+di controllo (`s_axi_ctrl`). È il comportamento di default di un component HLS:
+un dominio di clock, uno solo.
+
+Nella pratica la domanda nasce subito. Se la IP serve ad accelerare un
+algoritmo, vuoi "pompare" sullo stream alla frequenza più alta possibile,
+mentre il bus di controllo — che tocchi quattro volte per transazione — non ha
+nessun bisogno di correre. Frequenze diverse per le due interfacce.
+
+**Si può fare, e HLS ha un parametro apposta.** Ma il vincolo che ci sta dietro
+è la parte importante da ricordare.
+
+#### 1. AXI4-Lite su clock separato, dentro HLS
+
+Il pragma di interfaccia accetta `clock=`:
+
+```cpp
+#pragma HLS INTERFACE mode=s_axilite port=gain bundle=ctrl clock=ctrl_clk
+```
+
+Dalla documentazione ufficiale (UG1399, *pragma HLS interface*):
+
+> *"By default, the AXI4-Lite interface clock is the same clock as the system
+> clock. This option is used to specify a separate clock for an AXI4-Lite
+> interface."*
+
+Se i registri stanno in un `bundle`, basta indicare `clock=` su **un solo**
+membro del bundle.
+
+Sembra la soluzione completa, ma non lo è, e il perché sta in due righe della
+pagina *Control Clock and Reset in AXI4-Lite Interfaces*:
+
+> *"AXI4-Lite interface clock must be synchronous to the clock used for the
+> synthesized logic (`ap_clk`). That is, both clocks must be derived from the
+> same master generator clock."*
+>
+> *"AXI4-Lite interface clock frequency must be equal to or less than the
+> frequency of the clock used for the synthesized logic (`ap_clk`)."*
+
+**Cioè: non sono due clock indipendenti.** Devono uscire dallo stesso
+MMCM/PLL, con un rapporto di frequenza definito (in pratica una divisione
+pulita), e AXI4-Lite non può mai essere più veloce del clock del datapath.
+
+Questo spiega la domanda naturale — *"e i sincronizzatori sui registri?"*.
+Passare un registro multi-bit fra due domini asincroni richiede più di un
+doppio flip-flop per bit: serve garantire che tutti i bit arrivino **insieme**
+(handshake, o aggiornamento solo quando il valore è stabile), altrimenti il
+lato lento può campionare una combinazione di bit vecchi e nuovi che non è mai
+esistita.
+
+La documentazione **non descrive nessuna logica di sincronizzazione inserita da
+HLS** per questo caso: né sincronizzatori, né handshake. E il motivo è
+esattamente il vincolo qui sopra — imponendo che i due clock nascano dallo
+stesso generatore, la relazione di fase fra i fronti è nota e stabile
+(caso *mesocrono*), e il problema di metastabilità non si presenta per
+costruzione. **Il vincolo non è una scocciatura burocratica: è il meccanismo
+stesso con cui il problema viene evitato.** Garantirlo a monte, nel clocking
+wizard, è responsabilità di chi progetta il sistema, non del tool.
+
+#### 2. AXI4-Lite su un clock davvero indipendente
+
+Se i due clock devono essere scorrelati (oscillatori diversi, o domini che non
+condividono il PLL), la soluzione non sta più dentro HLS ma un livello sopra.
+Dalla stessa pagina:
+
+> *"Vivado IP integrator will automatically generate a clock domain crossing
+> (CDC) slice that performs the same function as the control clock described
+> below, making use of the option unnecessary."*
+
+Collegando `s_axi_ctrl` a un segmento di interconnect con un clock diverso,
+**è Vivado IP Integrator a inserire da sé una vera slice di CDC** fra
+l'interconnect e la IP — un componente verificato, esterno all'RTL generato da
+HLS. A quel punto `clock=` non serve nemmeno più: lo dice il documento.
+
+#### 3. Lo stream stesso fra due domini scorrelati
+
+Caso diverso e più pesante: non il controllo, ma **i dati** che devono
+attraversare un confine di clock — una IP a monte a una frequenza, il DMA o la
+IP a valle a un'altra, senza relazione fra le due.
+
+Questo non si risolve con un pragma dentro una singola top function: le porte
+`axis` vivono su `ap_clk`, punto. Si risolve istanziando nel block design un
+componente dedicato, l'**AXI4-Stream Clock Converter** (della AXI4-Stream
+Infrastructure IP Suite, PG085), che è una FIFO asincrona con i sincronizzatori
+progettati e verificati per quel compito.
+
+#### In sintesi
+
+| Scenario | Dove si risolve | Meccanismo |
+|---|---|---|
+| AXI4-Lite più lento, **sincrono** e derivato dallo stesso generatore | dentro HLS | `clock=` sul bundle. Nessun CDC reale: è un vincolo di progetto che evita il problema |
+| AXI4-Lite su clock **realmente indipendente** | block design | CDC slice inserita automaticamente da Vivado IP Integrator |
+| **Lo stream** fra due domini scorrelati | block design | AXI4-Stream Clock Converter (IP dedicata, FIFO asincrona) |
+
+La nostra `axis_scaler` sta nel caso più semplice — un `ap_clk` per tutto — e
+così resta: il multi-clock non fa parte della scala didattica. È annotato qui
+perché è la prima domanda che si pone chi viene dall'hardware guardando quella
+entity, e perché il vincolo del generatore comune è la cosa da ricordare.
+
 ---
 
 ## 6. Cosa abbiamo osservato al gradino 1.3
