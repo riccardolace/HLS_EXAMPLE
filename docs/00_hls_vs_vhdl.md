@@ -364,28 +364,178 @@ si fa streaming continuo.
 byte non selezionati non vengono toccati. È esattamente il pezzo che si sbaglia
 scrivendo lo slave a mano.
 
-**3) La legge dell'interrupt non è quella che si legge in giro.** La
-formulazione diffusa (e la bozza del nostro piano) dice
-`interrupt = GIER & (ISR & IER)`. Il VHDL generato dice:
+**3) Il meccanismo di interrupt.**
 
-```vhdl
-interrupt <= int_interrupt;                              -- registrato
--- l'uscita:
-if (int_gie = '1' and (int_isr(0) or int_isr(1)) = '1') then int_interrupt <= '1';
--- il latch dentro ISR, questo sì filtrato da IER:
-if (int_ier(0) = '1' and ap_done  = '1') then int_isr(0) <= '1';
-if (int_ier(1) = '1' and ap_ready = '1') then int_isr(1) <= '1';
+#### Come si usano, in pratica
+
+Quattro registri, ciascuno con un ruolo preciso:
+
+| Registro | Off | Ruolo |
+|---|---|---|
+| `GIER` | 0x04 | abilitazione generale: se è 0, il pin `interrupt` non si alza mai, qualunque cosa sia successo |
+| `IER` | 0x08 | seleziona **quali eventi** verranno registrati: bit 0 = `ap_done` (elaborazione finita), bit 1 = `ap_ready` (blocco pronto a ripartire) |
+| `ISR` | 0x0C | **registra l'impulso** dell'evento avvenuto: il bit corrispondente viene messo a 1 dall'hardware e vi resta finché il software non lo azzera |
+| `CTRL` | 0x00 | bit 0 `ap_start` per avviare; bit 1 `ap_done` per il polling, in alternativa all'interrupt |
+
+La sequenza d'uso, nell'ordine corretto:
+
+```text
+1. write IER  = 0x1     // registra gli eventi di tipo ap_done
+2. write GIER = 0x1     // abilita l'uscita sul pin
+3. write CTRL = 0x1     // ap_start: l'IP parte
+   ... al termine dell'elaborazione ISR(0) va a 1 e il pin interrupt si alza ...
+4. write ISR  = 0x1     // azzera il bit: il pin torna basso
 ```
 
-**`IER` non filtra l'uscita: filtra il latch dentro `ISR`.** Due conseguenze
-pratiche che costano un pomeriggio se non le sai:
+I punti 1 e 2 **devono precedere il punto 3**: `IER` decide se l'impulso viene
+registrato nell'istante in cui avviene, e quell'istante dura un solo ciclo di
+clock. Abilitare dopo l'avvio significa perdere l'evento.
 
-- se abiliti `IER` **dopo** che `ap_done` si è alzato, l'evento è perso per
-  sempre — `ISR` non si è mai armato. Quindi: abilita gli interrupt *prima* di
-  scrivere `ap_start`;
-- azzerare `IER` **non** spegne un interrupt già pendente. `ISR` resta a 1 e il
-  pin resta alto. Per abbassarlo devi pulire `ISR` scrivendoci 1 (TOW, *toggle
-  on write*), oppure azzerare `GIER`, che invece maschera davvero l'uscita.
+Per azzerare un bit di `ISR` gli si scrive **1**, non 0. È la convenzione *toggle
+on write* (TOW): la scrittura di 1 inverte il bit, che essendo a 1 torna a 0.
+Documentata come tale nell'header `xaxis_scaler_hw.h` generato.
+
+#### Chi osserva il pin `interrupt`
+
+Il pin si alza quando **`GIER = 1` e almeno un bit di `ISR` è a 1**. Non dipende
+da altro.
+
+Va però chiarito un punto: il software non legge il pin. `interrupt` è un filo
+fisico come `ap_start`, e va collegato a un **controller di interrupt**, un
+componente hardware separato che sta fra la IP e il processore. È quel controller
+a rilevare la transizione e a interrompere l'esecuzione della CPU, dirottandola
+su una funzione di gestione registrata dal driver.
+
+```text
+ap_done  (impulso di 1 ciclo)
+   └─> ISR(0) = 1            se IER(0) era già a 1
+         └─> pin interrupt    se GIER = 1
+               └─> controller di interrupt (esterno alla IP)
+                     └─> la CPU viene interrotta, esegue l'handler
+                           └─> l'handler legge ISR, poi ci scrive 1 per azzerarlo
+```
+
+La differenza rispetto al polling è tutta qui: con il polling il software
+interroga ripetutamente `CTRL` bit 1; con l'interrupt il software fa altro e
+viene avvisato.
+
+**Nel nostro progetto quel controller non esiste ancora.** La IP termina al pin,
+che è presente e corretto ma non collegato a nulla. Il collegamento arriverà
+quando l'IP verrà inserita in un block design con un processore.
+
+#### Perché il meccanismo è fatto così
+
+Parti da un fatto fisico, verificato tracciando `ap_done` fino alla sua origine
+nel top-level (`axis_scaler.vhd`): **`ap_done` è un impulso di un solo ciclo di
+clock**, non un livello che resta alto. Il blocco finisce di elaborare, alza
+`ap_done` per un ciclo, e lo riabbassa (a meno di `auto_restart`, che qui non
+usiamo).
+
+Un impulso di un ciclo è un problema per un processore: se il software non sta
+guardando esattamente in quel ciclo — ed è la norma, un processore fa un milione
+di altre cose — l'evento è perso. Serve qualcosa che "ricordi" che l'impulso c'è
+stato, finché qualcuno non se ne accorge. Quel qualcosa è un **latch**: un bit
+che l'hardware accende da solo e che resta acceso finché il software non lo
+spegne esplicitamente.
+
+**Scoperta tracciando l'RTL per intero: il banco registri ne costruisce DUE, in
+parallelo, dallo stesso impulso** — uno per il polling, uno per l'interrupt:
+
+```vhdl
+-- Percorso 1: il bit CTRL[1] che leggi quando fai polling
+task_ap_done      <= ap_done ...;                    -- (con auto_restart=0, è ap_done tal quale)
+if (task_ap_done = '1') then int_task_ap_done <= '1';        -- si accende da solo
+elsif (ar_hs='1' and raddr=ADDR_AP_CTRL) then int_task_ap_done <= '0';  -- si spegne LEGGENDO (COR)
+
+-- Percorso 2: il bit ISR(0) che leggi/aspetti quando usi l'interrupt
+if (int_ier(0) = '1' and ap_done = '1') then int_isr(0) <= '1';         -- si accende SOLO se IER era già alto
+elsif (w_hs='1' and waddr=ADDR_ISR and WDATA(0)='1') then
+    int_isr(0) <= int_isr(0) xor WDATA(0);           -- si spegne SCRIVENDOCI 1 (TOW)
+
+-- Il pin fisico, ricalcolato ogni ciclo:
+if (int_gie = '1' and (int_isr(0) or int_isr(1)) = '1') then int_interrupt <= '1';
+else int_interrupt <= '0';
+end if;
+```
+
+Due latch indipendenti, due modi di spegnersi diversi (leggere per uno,
+scrivere 1 per l'altro), e **solo il secondo passa da `IER`**. Questo smentisce
+la formula che si legge in giro — `interrupt = GIER & (ISR & IER)` — che
+suggerisce un unico AND fra i tre. Nel VHDL vero, `IER` non tocca mai l'uscita:
+decide solo se l'impulso *entra* nel latch `ISR`. Una volta dentro, il pin
+dipende soltanto da `GIER` e da `ISR`.
+
+**In sequenza, con i tempi reali** (`interrupt` è un segnale registrato, quindi
+segue `ISR` con un ciclo di ritardo, che a sua volta segue `ap_done` con un
+ciclo — due registri in cascata):
+
+```text
+ciclo:          N        N+1       N+2
+ap_done:        1        0         0      <- l'impulso, un solo ciclo
+ISR(0):         0        1         1      <- si accende un ciclo dopo (se IER=1 era già scritto)
+interrupt:      0        0         1      <- si accende un ciclo dopo ISR
+```
+
+**Esempio A — la sequenza corretta.** Config e abilitazione *prima* di partire:
+
+```text
+1. write IER  = 0x1     // "mi interessano gli eventi di tipo ap_done"
+2. write GIER = 0x1     // "e voglio che arrivino sul pin fisico"
+3. write CTRL = 0x1     // ap_start=1 — l'IP parte
+   ... elabora il pacchetto ...
+   ... ap_done pulsa un ciclo, ISR(0) si accende, interrupt sale ...
+4. (il pin sveglia la CPU, entra nel gestore di interrupt)
+5. write ISR = 0x1      // spegne il latch (toggle on write)
+   ... interrupt scende il ciclo dopo ...
+6. leggi il risultato
+```
+
+**Esempio B — l'errore che perde l'evento per sempre.** Stessa sequenza, ordine
+sbagliato:
+
+```text
+1. write CTRL = 0x1     // ap_start=1 — IER è ancora 0!
+   ... ap_done pulsa: la condizione "IER(0)='1' and ap_done='1'" è FALSA ...
+   ... ISR(0) resta a 0, per sempre: quell'impulso non esiste più ...
+2. write IER  = 0x1     // troppo tardi
+3. write GIER = 0x1
+   ... nessun interrupt arriverà mai per questa transazione ...
+```
+
+Da qui la regola pratica: **gli interrupt si abilitano prima di `ap_start`, mai
+dopo.**
+
+**Esempio C — l'errore opposto: credere che disabilitare spenga.**
+
+```text
+   ... interrupt è alto (GIER=1, ISR(0)=1) ...
+1. write IER = 0x0      // "disabilito" i futuri eventi ap_done
+   ... ISR(0) non viene toccato da questa scrittura: resta 1 ...
+   ... interrupt resta alto: la condizione dipende da GIER e ISR, non da IER ...
+```
+
+`IER` decide cosa entrerà in futuro, non ripulisce cosa è già dentro. Per
+spegnere un interrupt pendente ci sono solo due vie: pulire `ISR` (scrivendoci
+1, il modo corretto e mirato) oppure azzerare `GIER` (che maschera *tutti* gli
+interrupt, anche quelli legittimi che arriveranno dopo — va bene solo se vuoi
+tacitare l'intera IP).
+
+**Se non ti serve l'interrupt, non serve nessuno di questi quattro registri
+tranne `CTRL`.** Il percorso 1 (`task_ap_done` → `CTRL[1]`, *clear on read*)
+esiste comunque e basta per il polling:
+
+```text
+write CTRL = 0x1              // ap_start
+loop: read CTRL until bit1==1 // quella stessa lettura lo consuma (COR)
+```
+
+| Registro | Si accende quando | Si spegne quando | Serve per |
+|---|---|---|---|
+| `CTRL` bit1 | `ap_done` pulsa | **lo leggi** (COR) | polling |
+| `IER` | scrivi tu | scrivi tu | decidere quali eventi armare `ISR` |
+| `ISR` | `ap_done`/`ap_ready` pulsa, **e** il bit `IER` corrispondente era già alto | **ci scrivi 1** (TOW) | far salire il pin `interrupt` |
+| `GIER` | scrivi tu | scrivi tu | interruttore generale, maschera il pin senza toccare `ISR` |
+| `interrupt` (pin) | `GIER=1` e almeno un bit di `ISR` è alto | `GIER=0`, oppure pulisci tutto `ISR` | sveglia la CPU |
 
 ### Il costo in risorse
 
