@@ -5,7 +5,7 @@ dati **AXI4-Stream** e banco registri **AXI4-Lite** (configurazione, stato,
 controllo, interrupt), fino a farla entrare nel catalogo IP di Vivado come una
 IP AMD.
 
-**Stato attuale: gradino 1.1 — pass-through.**
+**Stato attuale: gradino 1.2 — controllo su AXI4-Lite.**
 
 ---
 
@@ -64,7 +64,7 @@ cambiato nell'hardware generato.
 | # | Cosa si aggiunge | Cosa si scopre | Stato |
 |---|---|---|---|
 | 1.1 | Pass-through, solo pragma `axis` | I pin `ap_start`/`ap_done`/`ap_idle`/`ap_ready` esistono davvero | ✅ fatto |
-| 1.2 | `s_axilite` su `return` | Quei pin spariscono dentro `s_axi_ctrl` + `interrupt` | — |
+| 1.2 | `s_axilite` su `return` | Quei pin lasciano il bordo del modulo: nascono `s_axi_ctrl` + `interrupt`, e i registri CTRL/GIER/IER/ISR | ✅ fatto |
 | 1.3 | Primo registro di configurazione | L'ordine degli argomenti C **è** la mappa registri | — |
 | 1.4 | Primo registro di stato | Perché un output è un puntatore, e il bit `ap_vld` | — |
 | 1.5 | Controllo esplicito del pipeline | II, latenza, throughput | — |

@@ -2,7 +2,26 @@
 //  axis_scaler_tb.cpp  --  Testbench auto-verificante
 // =============================================================================
 //
-//  GRADINO 1.1
+//  GRADINO 1.2
+//
+//  --------------------------------------------------------------------------
+//  QUESTO FILE NON E' CAMBIATO rispetto al gradino 1.1, e non e' una pigrizia:
+//  e' una proprieta' del flusso che vale la pena capire subito.
+//
+//  Il gradino 1.2 ha aggiunto un banco registri AXI4-Lite. La simulazione C
+//  non lo vede e non lo puo' vedere: qui non esistono ne' bus, ne' indirizzi,
+//  ne' ap_start. Chiamare  axis_scaler(s_axis, m_axis)  E' l'equivalente
+//  astratto di "scrivi 1 in CTRL bit0 e aspetta CTRL bit1".
+//
+//  Conseguenza pratica, da tenere a mente per tutto il progetto:
+//
+//      la C simulation verifica l'ALGORITMO, non le INTERFACCE.
+//
+//  Se sbagli un pragma di interfaccia, csim resta verde. Chi verifica le
+//  interfacce e' la C/RTL cosimulation (Fase 3), che gira l'RTL vero con
+//  clock e handshake, e poi la simulazione del block design con gli AXI VIP
+//  (Fase 5), dove i registri verranno scritti davvero attraverso il bus.
+//  --------------------------------------------------------------------------
 //
 //  Questo file NON viene sintetizzato. Viene compilato con g++ e girato sul
 //  PC, come un normale programma C++. E' l'equivalente del tuo testbench VHDL,
@@ -164,7 +183,7 @@ static int prova_pacchetto(int n_campioni)
 int main()
 {
     printf("=====================================================\n");
-    printf(" axis_scaler -- testbench gradino 1.1 (pass-through)\n");
+    printf(" axis_scaler -- testbench gradino 1.2 (pass-through)\n");
     printf("=====================================================\n");
 
     int errori = 0;

@@ -2,16 +2,23 @@
 //  axis_scaler.hpp  --  Tipi e dichiarazione dell'IP
 // =============================================================================
 //
-//  GRADINO 1.1 della costruzione incrementale.
+//  GRADINO 1.2 della costruzione incrementale.
 //
-//  Versione "pass-through": lo stream in ingresso viene copiato tale e quale
-//  sullo stream in uscita. Nessuna elaborazione, nessun registro, nessun
-//  AXI-Lite. Serve a rispondere a UNA domanda sola:
+//  QUESTO FILE NON E' CAMBIATO rispetto al gradino 1.1, ed e' un fatto che
+//  vale la pena notare: il gradino 1.2 aggiunge il banco registri AXI4-Lite
+//  di controllo, e la firma della funzione resta identica.
 //
-//        "quali porte hardware nascono dai soli pragma di interfaccia AXI-Stream?"
+//  Il motivo e' che quel banco registri non trasporta DATI dell'algoritmo:
+//  contiene i segnali di controllo del blocco (ap_start, ap_done, ...), che
+//  in C non sono argomenti perche' sono impliciti nel concetto stesso di
+//  "chiamata di funzione". Il pragma s_axilite su "return" li rende
+//  raggiungibili da un bus, ma non aggiunge nulla da passare.
 //
-//  Nei gradini successivi aggiungeremo una cosa per volta e ogni volta
-//  guarderemo cosa e' cambiato nell'RTL generato.
+//  Dal gradino 1.3, quando arriveranno i veri registri di configurazione,
+//  ogni nuovo registro sara' invece un nuovo argomento QUI.
+//
+//  La funzione resta un "pass-through": lo stream in ingresso viene copiato
+//  tale e quale sullo stream in uscita, senza elaborazione.
 //
 // =============================================================================
 #ifndef AXIS_SCALER_HPP
@@ -49,9 +56,20 @@ static const int C_DATA_WIDTH = 32;
 //  2) IL TIPO DEL PACCHETTO AXI4-STREAM
 // =============================================================================
 //
-//  ap_axis<WData, WUser, WId, WDest> e' una struct che rappresenta UNA
-//  "beat" di AXI4-Stream, cioe' un colpo di clock in cui TVALID e TREADY sono
-//  entrambi alti. I suoi campi diventano i segnali fisici del bus:
+//  ap_axis<WData, WUser, WId, WDest> rappresenta UNA "beat" di AXI4-Stream,
+//  cioe' un colpo di clock in cui TVALID e TREADY sono entrambi alti.
+//
+//  Precisazione utile (verificata leggendo l'header del tool, vedi docs/01):
+//  ap_axis NON e' una struct, e' un ALIAS. Il tipo vero e' hls::axis, e la
+//  definizione in /tools/Xilinx/2025.2/Vitis/include/ap_axi_sdata.h e':
+//
+//        using ap_axis = hls::axis<ap_int<WData>, WUser, WId, WDest, ...>
+//
+//  Quindi il nostro ap_axis<32,0,0,0> e', per il compilatore,
+//  hls::axis<ap_int<32>, 0, 0, 0>. Nota che il primo parametro di hls::axis
+//  e' il TIPO del dato, non la sua larghezza in bit.
+//
+//  I campi diventano i segnali fisici del bus:
 //
 //        campo C++          segnale RTL         cosa e'
 //        ---------          -----------         -------------------------------

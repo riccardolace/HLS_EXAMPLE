@@ -163,3 +163,48 @@ viene da lì: la entity generata è perfettamente leggibile e si presta a essere
 confrontata gradino per gradino con quello che abbiamo scritto in C. Occhio però:
 **la cosim di default simula il Verilog**, non il VHDL (nel report la riga `VHDL`
 dice `NA`). Per simulare il file che stai leggendo serve `cosim.rtl=vhdl`.
+
+---
+
+## 7. Ispezionare cosa è cambiato: GUI e CLI affiancate
+
+Dal gradino 1.2 in poi il lavoro vero non è "lanciare la sintesi": è **leggere
+l'artefatto generato e confrontarlo con quello di prima**. Queste sono le
+operazioni che servono a farlo, nelle due forme.
+
+| Cosa vuoi vedere | Nella GUI | Da riga di comando |
+|---|---|---|
+| Modificare un pragma di interfaccia | Apri `src/axis_scaler.cpp` nell'editor e scrivilo a mano. In alternativa, col cursore sulla funzione, pannello **HLS DIRECTIVES** → `+` → `INTERFACE`: la GUI scrive il pragma nel sorgente | è una modifica al file, nessun comando |
+| **Tabella delle interfacce** (le porte RTL vere) | *Flow* → **C SYNTHESIS → Reports → Synthesis** → sezione *Interface* | `grep -A40 '== Interface' workspace/axis_scaler/axis_scaler/hls/syn/report/axis_scaler_csynth.rpt` |
+| **La entity VHDL generata** | *Explorer* → `axis_scaler/hls/syn/vhdl/axis_scaler.vhd` (doppio click) | `make entity` |
+| Confronto entity prima/dopo | copia la entity in un file prima di risintetizzare, poi *Compare With* | `sed -n '/^entity axis_scaler is/,/^end;/p' .../axis_scaler.vhd > entity_1.2.vhd` e poi `diff -u entity_1.1.vhd entity_1.2.vhd` |
+| Risorse (FF/LUT/DSP) | *Reports → Synthesis* → *Utilization Estimates* | `sed -n '/Utilization Estimates/,/^$/p' .../axis_scaler_csynth.rpt` |
+| **La mappa registri** `_hw.h` | *Explorer* → `axis_scaler/hls/impl/ip/drivers/axis_scaler_v1_0/src/xaxis_scaler_hw.h` | `cat $(find workspace -path '*impl/ip/drivers*' -name '*_hw.h')` |
+| I moduli RTL generati (quali file nuovi sono comparsi) | *Explorer* → cartella `syn/vhdl/` | `ls workspace/axis_scaler/axis_scaler/hls/syn/vhdl/` |
+| Cosa ha deciso il tool sulle direttive | *Explorer* → `syn/inferred_directives.ini` | `cat workspace/axis_scaler/axis_scaler/hls/syn/inferred_directives.ini` |
+
+**Abitudine da prendere subito**: prima di risintetizzare, salva da parte la
+entity e il report del gradino corrente. Senza il "prima" non esiste il
+confronto, e il confronto è il punto di tutto il metodo. Questo progetto lo fa in
+`/tmp`, ma va bene qualunque posto.
+
+### Una asimmetria utile da conoscere
+
+Con `flow_target=vivado`, **`make csynth` esegue anche il packaging dell'IP**. Nel
+log lo vedi:
+
+```text
+INFO: [IMPL 213-8] Exporting RTL as a Vivado IP.
+INFO: Add axi4lite interface s_axi_ctrl
+INFO: Add interrupt interface interrupt
+INFO: Created IP archive .../xilinx_com_hls_axis_scaler_1_0.zip
+```
+
+Quindi dopo una semplice sintesi hai già `component.xml`, lo `.zip` per il
+catalogo e i driver C con `_hw.h`. `make ip` (*PACKAGE → Run*) serve a rifare
+esplicitamente quel passo, tipicamente dopo aver cambiato i metadati
+`package.ip.*` (vendor, versione, taxonomy) — cosa che faremo in Fase 4.
+
+Nota sui nomi: lo `.zip` si chiama ancora `xilinx_com_hls_axis_scaler_1_0.zip`
+perché non abbiamo ancora impostato `package.ip.vendor`. Il VLNV definitivo
+(`riclab.io:hls:axis_scaler:1.0`) arriverà in Fase 4.

@@ -242,3 +242,235 @@ della Fase 3, dove aggiungeremo anche `cosim.random_stall=1` per stressare la
 backpressure e vedere la IP fermarsi davvero. (Allo stato attuale lo stall è a
 `delay == 0` su tutte le porte, cioè disattivato: i numeri qui sopra sono
 "puliti", senza ritardi artificiali.)
+
+---
+
+## 5. Cosa abbiamo osservato al gradino 1.2
+
+Modifica: **una riga**, il pragma di controllo del blocco.
+
+```diff
+- #pragma HLS INTERFACE mode=ap_ctrl_hs port=return
++ #pragma HLS INTERFACE mode=s_axilite  port=return bundle=ctrl
+```
+
+Nient'altro. Algoritmo identico, testbench identico, header identico.
+
+### La entity: il diff vero
+
+```diff
+ entity axis_scaler is
++generic (
++    C_S_AXI_CTRL_ADDR_WIDTH : INTEGER := 4;
++    C_S_AXI_CTRL_DATA_WIDTH : INTEGER := 32 );
+ port (
+     ap_clk : IN STD_LOGIC;
+     ap_rst_n : IN STD_LOGIC;
+-    ap_start : IN STD_LOGIC;
+-    ap_done : OUT STD_LOGIC;
+-    ap_idle : OUT STD_LOGIC;
+-    ap_ready : OUT STD_LOGIC;
+     ...  (tutti i segnali s_axis_* / m_axis_* invariati)
++    s_axi_ctrl_AWVALID : IN STD_LOGIC;
++    s_axi_ctrl_AWREADY : OUT STD_LOGIC;
++    s_axi_ctrl_AWADDR : IN STD_LOGIC_VECTOR (C_S_AXI_CTRL_ADDR_WIDTH-1 downto 0);
++    s_axi_ctrl_WVALID/WREADY/WDATA/WSTRB      -- canale di scrittura dato
++    s_axi_ctrl_ARVALID/ARREADY/ARADDR         -- canale di lettura indirizzo
++    s_axi_ctrl_RVALID/RREADY/RDATA/RRESP      -- canale di lettura dato
++    s_axi_ctrl_BVALID/BREADY/BRESP            -- canale di risposta
++    interrupt : OUT STD_LOGIC );
+ end;
+```
+
+Quattro pin via, diciassette dentro, più un `interrupt`. Ed è comparso un
+**generic**: `C_S_AXI_CTRL_ADDR_WIDTH = 4`. Quattro bit di indirizzo = 16 byte =
+esattamente i quattro registri da 32 bit che abbiamo ora. **Da tenere d'occhio al
+gradino 1.3:** quando aggiungeremo un registro di configurazione questo numero
+dovrà crescere, ed è la conferma fisica che la mappa registri si allarga.
+
+### La cosa che inganna: i quattro pin non sono spariti
+
+`grep` sui segnali interni di `axis_scaler.vhd`:
+
+```vhdl
+signal ap_start : STD_LOGIC;
+signal ap_done  : STD_LOGIC;
+signal ap_idle  : STD_LOGIC;
+signal ap_ready : STD_LOGIC;
+```
+
+Ci sono ancora tutti. Sono diventati fili **interni**, tra il banco registri e la
+logica di calcolo:
+
+```vhdl
+ctrl_s_axi_U : component axis_scaler_ctrl_s_axi
+port map (
+    AWVALID => s_axi_ctrl_AWVALID,
+    ...
+    ACLK     => ap_clk,
+    ARESET   => ap_rst_n_inv,      -- nota: lo slave AXI vuole reset ATTIVO ALTO,
+    ACLK_EN  => ap_const_logic_1,  -- HLS inserisce l'inverter da solo
+    ap_start => ap_start,          -- ┐
+    interrupt=> interrupt,         -- │ i quattro segnali di prima,
+    ap_ready => ap_ready,          -- │ ora cablati al banco registri
+    ap_done  => ap_done,           -- │
+    ap_idle  => ap_idle);          -- ┘
+```
+
+Lo dice anche il log di sintesi, in modo inequivocabile:
+
+```text
+INFO: [RTGEN 206-500] Setting interface mode on function 'axis_scaler'
+                      to 's_axilite & ap_ctrl_hs'.
+INFO: [RTGEN 206-100] Bundling port 'return' to AXI-Lite port ctrl.
+```
+
+`s_axilite` **&** `ap_ctrl_hs`, non "invece di". Il modello di esecuzione del
+gradino 1.1 — *una chiamata della funzione = una transazione dell'IP* — è
+esattamente lo stesso. È cambiato solo **chi** alza `ap_start`: prima un altro
+modulo RTL, ora una scrittura sul bus. Questa è la frase da portarsi dietro:
+
+> `s_axilite` su `return` non cambia il protocollo del blocco, cambia il modo di
+> raggiungerlo.
+
+### Il file nuovo: il banco registri
+
+In `syn/vhdl/` è comparso `axis_scaler_ctrl_s_axi.vhd`, **14,4 kB**: la macchina
+a stati dello slave AXI4-Lite, la decodifica degli indirizzi, i registri e la
+logica di interrupt. È il codice che in VHDL avresti scritto o incollato a mano —
+tipicamente 300-400 righe, con almeno un bug nella gestione di `WSTRB`.
+
+Vale la pena aprirlo e leggerne tre pezzi, perché sono idiomi di registro che
+ritroverai in ogni IP AMD.
+
+**1) `ap_start` è *clear on handshake* (COH), non un normale bit R/W:**
+
+```vhdl
+if (w_hs = '1' and waddr = ADDR_AP_CTRL and WSTRB(0) = '1' and WDATA(0) = '1') then
+    int_ap_start <= '1';
+elsif (ap_ready = '1') then
+    int_ap_start <= int_auto_restart;   -- clear on handshake/auto restart
+end if;
+```
+
+Scrivi 1, e l'hardware lo riazzera da solo quando il blocco parte. Non devi
+riscriverci 0: se lo facessi rischieresti di annullare l'avvio. Il software fa
+"scrivi 1 e dimenticalo". E si vede anche il ruolo di `auto_restart` (bit 7):
+se è alto, `ap_start` **non** si azzera → il blocco riparte da solo, che è come
+si fa streaming continuo.
+
+**2) `WSTRB` viene davvero rispettato.** Quel `WSTRB(0) = '1'` nella condizione
+è la gestione delle scritture parziali: se il processore scrive un solo byte, i
+byte non selezionati non vengono toccati. È esattamente il pezzo che si sbaglia
+scrivendo lo slave a mano.
+
+**3) La legge dell'interrupt non è quella che si legge in giro.** La
+formulazione diffusa (e la bozza del nostro piano) dice
+`interrupt = GIER & (ISR & IER)`. Il VHDL generato dice:
+
+```vhdl
+interrupt <= int_interrupt;                              -- registrato
+-- l'uscita:
+if (int_gie = '1' and (int_isr(0) or int_isr(1)) = '1') then int_interrupt <= '1';
+-- il latch dentro ISR, questo sì filtrato da IER:
+if (int_ier(0) = '1' and ap_done  = '1') then int_isr(0) <= '1';
+if (int_ier(1) = '1' and ap_ready = '1') then int_isr(1) <= '1';
+```
+
+**`IER` non filtra l'uscita: filtra il latch dentro `ISR`.** Due conseguenze
+pratiche che costano un pomeriggio se non le sai:
+
+- se abiliti `IER` **dopo** che `ap_done` si è alzato, l'evento è perso per
+  sempre — `ISR` non si è mai armato. Quindi: abilita gli interrupt *prima* di
+  scrivere `ap_start`;
+- azzerare `IER` **non** spegne un interrupt già pendente. `ISR` resta a 1 e il
+  pin resta alto. Per abbassarlo devi pulire `ISR` scrivendoci 1 (TOW, *toggle
+  on write*), oppure azzerare `GIER`, che invece maschera davvero l'uscita.
+
+### Il costo in risorse
+
+|  | FF | LUT | DSP | BRAM | II | Slack |
+|---|---|---|---|---|---|---|
+| 1.1 | 4 | 12 | 0 | 0 | 1 | 0.761 ns |
+| 1.2 | **40** | **52** | 0 | 0 | **1** | **0.761 ns** |
+
+Il report attribuisce l'aumento a un'unica istanza:
+
+```text
+|   Instance   |   Module   | BRAM_18K| DSP| FF | LUT| URAM|
+|ctrl_s_axi_U  |ctrl_s_axi  |        0|   0|  36|  40|    0|
+```
+
+36 FF e 40 LUT per un banco registri con quattro registri: è il prezzo onesto
+di un'interfaccia AXI4-Lite. **Ma timing e throughput sono identici**: stesso
+slack, stesso `II = 1`, stessa *iteration latency* di 2 cicli. Il controllo
+software è un blocco a lato, non è sul percorso dei dati. È un fatto
+architetturale che vale la pena notare: rendere una IP pilotabile da software non
+la rallenta.
+
+### La C simulation è cieca alle interfacce
+
+`make csim` è passato senza toccare il testbench, con output **identico** al
+gradino 1.1. Non è una svista: in simulazione C non esistono bus, indirizzi né
+`ap_start`. Chiamare `axis_scaler(s_axis, m_axis)` *è* l'equivalente astratto di
+"scrivi 1 in `CTRL` bit 0 e aspetta `CTRL` bit 1".
+
+> La C simulation verifica l'**algoritmo**, non le **interfacce**.
+
+Se sbagli un pragma di interfaccia, csim resta verde. Le interfacce le verificano
+la C/RTL cosimulation (Fase 3) e la simulazione del block design con gli AXI VIP
+(Fase 5), dove i registri verranno scritti davvero attraverso il bus.
+
+### Il primo `_hw.h`
+
+```c
+// 0x0 : Control signals
+//       bit 0  - ap_start (Read/Write/COH)
+//       bit 1  - ap_done (Read/COR)
+//       bit 2  - ap_idle (Read)
+//       bit 3  - ap_ready (Read/COR)
+//       bit 7  - auto_restart (Read/Write)
+//       bit 9  - interrupt (Read)
+// 0x4 : Global Interrupt Enable Register
+// 0x8 : IP Interrupt Enable Register (Read/Write)
+// 0xc : IP Interrupt Status Register (Read/TOW)
+// (SC = Self Clear, COR = Clear on Read, TOW = Toggle on Write, COH = Clear on Handshake)
+
+#define XAXIS_SCALER_CTRL_ADDR_AP_CTRL 0x0
+#define XAXIS_SCALER_CTRL_ADDR_GIE     0x4
+#define XAXIS_SCALER_CTRL_ADDR_IER     0x8
+#define XAXIS_SCALER_CTRL_ADDR_ISR     0xc
+```
+
+Il prefisso `XAXIS_SCALER_CTRL_` viene dal nome del bundle: `bundle=ctrl` →
+`..._CTRL_...`. Ecco perché conviene scegliere il nome del bundle e congelarlo:
+finisce nei nomi del driver software, non solo nella porta del block design.
+
+Le sigle in fondo sono il vocabolario dei registri hardware AMD e vanno lette con
+attenzione, perché descrivono **comportamenti**, non permessi:
+
+| Sigla | Significato | Conseguenza per il software |
+|---|---|---|
+| COH | *clear on handshake* | scrivi 1 e basta, l'hardware azzera da sé (`ap_start`) |
+| COR | *clear on read* | **leggere è distruttivo**: `ap_done` letto una volta è consumato |
+| TOW | *toggle on write* | per pulire un bit ci scrivi **1**, non 0 (`ISR`) |
+| SC | *self clear* | si azzera da solo dopo un ciclo |
+
+`COR` su `ap_done` merita un avvertimento: se nel debug leggi `CTRL` "per
+guardare" e poi il driver lo rilegge, il secondo lettore trova `ap_done` a zero e
+aspetta per sempre. È un classico.
+
+Nota di flusso: **questo header è già stato generato da `make csynth`**, non è
+servito `make ip`. Con `flow_target=vivado` il packaging gira automaticamente in
+coda alla sintesi (nel log: `INFO: [IMPL 213-8] Exporting RTL as a Vivado IP`), e
+lo stesso file compare in tre copie identiche:
+
+```text
+impl/ip/drivers/axis_scaler_v1_0/src/xaxis_scaler_hw.h    <- quella dell'IP
+impl/misc/drivers/axis_scaler_v1_0/src/xaxis_scaler_hw.h
+.autopilot/db/driver/src/xaxis_scaler_hw.h                <- interna al tool
+```
+
+Accanto ci sono già anche `xaxis_scaler.h` / `.c` (il driver bare-metal) e
+`xaxis_scaler_linux.c`. Li leggeremo in Fase 4, quando la mappa registri sarà
+completa.
