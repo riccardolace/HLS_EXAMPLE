@@ -83,4 +83,3 @@ export come IP di catalogo → verifica in block design Vivado con AXI VIP.
 - Vivado + Vitis **2025.2** in `/tools/Xilinx/2025.2`
 - Parte target: `xcvc1902-vsva2197-2MP-e-S` (VCK190, Versal AI Core)
 - Clock: 4.0 ns (250 MHz)
-# HLS_EXAMPLE
