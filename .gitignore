@@ -18,3 +18,7 @@ vivado*.str
 
 # Progetti Vivado (rigenerabili dagli script in vivado/scripts/)
 vivado/proj/
+
+# Istruzioni di lavoro per Claude Code: metodo e contesto della sessione,
+# non contenuto del tutorial. Resta sul disco locale, non va su GitHub.
+CLAUDE.md
