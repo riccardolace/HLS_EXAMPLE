@@ -1,0 +1,20 @@
+# =============================================================================
+#  Cosa NON va versionato
+# =============================================================================
+#
+#  Regola: si versiona quello che un essere umano ha scritto, non quello che un
+#  tool puo' rigenerare. Il workspace Vitis e' interamente ricostruibile con
+#  "make workspace", quindi non ha senso tenerlo in git.
+# =============================================================================
+
+# Il workspace Vitis: rigenerabile con  make workspace
+workspace/
+
+# Log e journal dei tool
+*.log
+*.jou
+vivado*.str
+.Xil/
+
+# Progetti Vivado (rigenerabili dagli script in vivado/scripts/)
+vivado/proj/
