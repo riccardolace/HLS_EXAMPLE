@@ -539,10 +539,14 @@ loop: read CTRL until bit1==1 // quella stessa lettura lo consuma (COR)
 
 ### Il costo in risorse
 
-|  | FF | LUT | DSP | BRAM | II | Slack |
+|  | FF | LUT | DSP | BRAM | II | Estimated |
 |---|---|---|---|---|---|---|
 | 1.1 | 4 | 12 | 0 | 0 | 1 | 0.761 ns |
 | 1.2 | **40** | **52** | 0 | 0 | **1** | **0.761 ns** |
+
+(«Estimated» è la colonna omonima della tabella *Timing* del report: la stima
+del **percorso critico**, da confrontare con il target di 4,00 ns. Non è lo
+slack — più piccola è, meglio è.)
 
 Il report attribuisce l'aumento a un'unica istanza:
 
@@ -553,7 +557,7 @@ Il report attribuisce l'aumento a un'unica istanza:
 
 36 FF e 40 LUT per un banco registri con quattro registri: è il prezzo onesto
 di un'interfaccia AXI4-Lite. **Ma timing e throughput sono identici**: stesso
-slack, stesso `II = 1`, stessa *iteration latency* di 2 cicli. Il controllo
+percorso critico stimato, stesso `II = 1`, stessa *iteration latency* di 2 cicli. Il controllo
 software è un blocco a lato, non è sul percorso dei dati. È un fatto
 architetturale che vale la pena notare: rendere una IP pilotabile da software non
 la rallenta.
@@ -856,7 +860,7 @@ logica, per non perdere il mapping sui DSP che ha pianificato.
 
 ### Il costo: ora c'è silicio vero
 
-| | DSP | FF | LUT | II | Iter. latency | Slack | Fmax |
+| | DSP | FF | LUT | II | Iter. latency | Estimated | Fmax |
 |---|---|---|---|---|---|---|---|
 | 1.2 | 0 | 40 | 52 | 1 | 2 | 0,761 ns | 1314 MHz |
 | 1.3 | **4** | **223** | **166** | **1** | **4** | **2,238 ns** | **447 MHz** |
@@ -880,8 +884,9 @@ dedicata e non solo logica generica.
 `gain` a 32 bit e la logica di decodifica del suo indirizzo. Coerente:
 un registro in più costa circa 32 flip-flop più il contorno.
 
-**c) Il timing è peggiorato molto, e non è un problema.** Lo slack passa da
-0,761 ns a 2,238 ns, cioè la Fmax stimata crolla da 1314 a 447 MHz. La ragione è
+**c) Il timing è peggiorato molto, e non è un problema.** Il percorso critico
+stimato passa da 0,761 ns a 2,238 ns, cioè la Fmax stimata crolla da 1314 a
+447 MHz. La ragione è
 strutturale: al gradino 1.2 il banco registri stava **a lato** del percorso dati,
 mentre il moltiplicatore ci sta **in mezzo**. Ma 447 MHz sono comunque quasi il
 doppio dei 250 MHz che abbiamo chiesto, quindi il vincolo è rispettato con
@@ -937,3 +942,485 @@ valori del gain (1, 0, negativo, enorme). Due meritano una nota:
 Quel test documenta il troncamento invece di evitarlo. Quando al gradino 1.8
 aggiungeremo la saturazione, **dovrà fallire** — e il fatto che fallisca sarà la
 prova che la saturazione funziona.
+
+---
+
+## 7. Cosa abbiamo osservato al gradino 1.4
+
+Modifica: **un argomento con un asterisco, un pragma, e una riga in fondo**.
+
+```diff
+  void axis_scaler(hls::stream<pkt_t> &s_axis,
+                   hls::stream<pkt_t> &m_axis,
+-                  int                 gain);
++                  int                 gain,
++                  int                *sample_count);
+
++ #pragma HLS INTERFACE mode=s_axilite port=sample_count bundle=ctrl
+
++ int conteggio = 0;
+  copia_pacchetto:
+  while (!ultimo) {
+      ...
++     conteggio++;
+  }
++ *sample_count = conteggio;
+```
+
+È il primo gradino in cui l'informazione torna **indietro**: dall'hardware al
+software, senza passare dallo stream.
+
+Il log di sintesi lo dice in una riga, e mette i due registri uno accanto
+all'altro:
+
+```text
+INFO: [RTGEN 206-500] Setting interface mode on port 'axis_scaler/gain'
+                      to 's_axilite & ap_none'.
+INFO: [RTGEN 206-500] Setting interface mode on port 'axis_scaler/sample_count'
+                      to 's_axilite & ap_vld'.
+```
+
+Stesso pragma, stesso bundle, protocollo interno **diverso**: `ap_none` per
+l'ingresso, `ap_vld` per l'uscita. Non l'abbiamo chiesto noi da nessuna parte:
+il tool l'ha dedotto dall'asterisco nella firma della funzione.
+
+### Lo slot `_CTRL` non è più "reserved"
+
+`xaxis_scaler_hw.h`, diff rispetto al gradino 1.3:
+
+```diff
+  // 0x10 : Data signal of gain
+  //        bit 31~0 - gain[31:0] (Read/Write)
+  // 0x14 : reserved
++ // 0x18 : Data signal of sample_count
++ //        bit 31~0 - sample_count[31:0] (Read)
++ // 0x1c : Control signal of sample_count
++ //        bit 0  - sample_count_ap_vld (Read/COR)
++ //        others - reserved
+
++ #define XAXIS_SCALER_CTRL_ADDR_SAMPLE_COUNT_DATA 0x18
++ #define XAXIS_SCALER_CTRL_BITS_SAMPLE_COUNT_DATA 32
++ #define XAXIS_SCALER_CTRL_ADDR_SAMPLE_COUNT_CTRL 0x1c
+```
+
+Tre cose, in ordine.
+
+**a) `gain` è rimasto a 0x10.** Abbiamo aggiunto l'argomento nuovo *in fondo*
+alla firma, e infatti nessun offset esistente si è mosso. È la regola
+**append-only** delle mappe registri: si aggiunge in coda, non si rimescola,
+esattamente come si estende un protocollo di rete o un formato di file. Più
+avanti (esperimento B, qui sotto) vedremo cosa succede quando la si viola.
+
+**b) `sample_count` è `(Read)`, `gain` era `(Read/Write)`.** Il software può
+leggere il registro di stato ma non scriverlo. Anche questo non l'abbiamo
+dichiarato: discende dall'asterisco.
+
+**c) Lo slot 0x1c esiste davvero, e contiene un bit.** Al gradino 1.3 avevamo
+notato `0x14 : reserved` e lasciato la domanda aperta. Ora si vede a cosa serve
+quella coppia di slot: HLS alloca **8 byte per ogni registro utente**, dato +
+controllo. Per un ingresso il secondo non serve e resta vuoto; per un'uscita
+ospita `<nome>_ap_vld`, documentato `Read/COR`.
+
+`COR` è il vocabolario del gradino 1.2: **clear on read**. Leggere quel bit lo
+consuma. Vale la stessa avvertenza di `ap_done`: se lo leggi "per guardare" in
+debug, il driver che lo rilegge dopo lo trova a zero.
+
+### La entity non cambia — e nemmeno il generic
+
+```text
+diff entity axis_scaler (1.3)  ->  entity axis_scaler (1.4):  nessuna differenza
+```
+
+**Zero righe cambiate.** Al gradino 1.3 avevamo previsto che `C_S_AXI_CTRL_ADDR_WIDTH`
+sarebbe cresciuto, e in effetti era passato da 4 a 5. Stavolta la previsione era
+che *non* cresce, e il conto lo diceva prima della sintesi: 5 bit indirizzano 32
+byte, cioè 0x00–0x1F, e il nostro registro più alto sta a 0x1C. Ci stiamo dentro
+esattamente. Il VHDL lo conferma:
+
+```vhdl
+constant ADDR_SAMPLE_COUNT_DATA_0 : INTEGER := 16#18#;
+constant ADDR_SAMPLE_COUNT_CTRL   : INTEGER := 16#1c#;
+constant ADDR_BITS                : INTEGER := 5;     -- invariato
+```
+
+> Un registro — di configurazione o di stato — non aggiunge **piedini**.
+> Aggiunge **indirizzi** dentro un bus che c'era già, e solo quando gli
+> indirizzi finiscono cresce il bus.
+
+Dove invece qualcosa cambia è un livello più sotto, nella entity del banco
+registri. Ed è il diff più istruttivo del gradino:
+
+```diff
+ entity axis_scaler_ctrl_s_axi is
+ port (
+     ...
+     gain                  :out  STD_LOGIC_VECTOR(31 downto 0);
++    sample_count          :in   STD_LOGIC_VECTOR(31 downto 0);
++    sample_count_ap_vld   :in   STD_LOGIC;
+     ap_start              :out  STD_LOGIC;
+```
+
+Guarda le direzioni, **dal punto di vista del banco registri**:
+
+| | direzione | chi scrive | chi legge |
+|---|---|---|---|
+| `gain` | `out` | il canale di scrittura AXI (WDATA) | il datapath |
+| `sample_count` | `in` | il datapath | il canale di lettura AXI (RDATA) |
+
+Lo stesso pragma, la stessa parola `bundle=ctrl`, e due fili che vanno in
+direzioni opposte. È la prova fisica che **il pragma dice dove, il C dice in che
+verso**.
+
+E c'è un filo in più: `sample_count_ap_vld`. Il dato da solo non basta.
+
+### Il VHDL del banco registri: due processi speculari
+
+Vale la pena metterli uno sotto l'altro, perché sono lo stesso registro visto
+da due lati.
+
+```vhdl
+-- gain: il BUS scrive, sotto maschera di byte (gradino 1.3)
+if (w_hs = '1' and waddr = ADDR_GAIN_DATA_0) then
+    int_gain <= (UNSIGNED(WDATA) and wmask) or ((not wmask) and int_gain);
+end if;
+
+-- sample_count: il DATAPATH scrive, quando alza il suo valido
+if (sample_count_ap_vld = '1') then
+    int_sample_count <= UNSIGNED(sample_count);
+end if;
+```
+
+Nessun `wmask` nel secondo: i byte enable servono a gestire le scritture
+parziali che arrivano dal processore, e il datapath non fa scritture parziali —
+deposita sempre la parola intera.
+
+Poi c'è il terzo processo, quello nuovo per davvero:
+
+```vhdl
+process (ACLK)
+begin
+    if (ACLK'event and ACLK = '1') then
+        if (ARESET = '1') then
+            int_sample_count_ap_vld <= '0';
+        elsif (ACLK_EN = '1') then
+            if (sample_count_ap_vld = '1') then
+                int_sample_count_ap_vld <= '1';
+            elsif (ar_hs = '1' and raddr = ADDR_SAMPLE_COUNT_CTRL) then
+                int_sample_count_ap_vld <= '0';   -- clear on read
+            end if;
+        end if;
+    end if;
+end process;
+```
+
+**Questo l'abbiamo già visto.** È lo stesso identico idioma di `int_task_ap_done`
+del gradino 1.2 (§5): un latch che l'hardware accende con un impulso di un ciclo
+e che il software spegne leggendolo. Stessa struttura, stesso motivo — un
+impulso di un ciclo di clock è invisibile a un processore, quindi qualcuno deve
+ricordarselo.
+
+Messa così, la cosa si semplifica parecchio: `_ap_vld` **non è un concetto
+nuovo**. È il `TVALID` di AXI4-Stream, o il `ap_done` del blocco, applicato a un
+singolo registro. In tutti e tre i casi la domanda a cui risponde è la stessa:
+*quello che sto guardando, è roba vera?*
+
+Nota che il registro **dato** (0x18) non è COR: puoi rileggerlo quante volte
+vuoi, resta lì. È solo il bit di validità (0x1c) che si consuma leggendolo.
+Il che dà al software due modi di lavorare:
+
+```text
+polling classico:   aspetta CTRL[1] (ap_done), poi leggi 0x18
+con il valido:      leggi 0x1c; se bit0 = 1, il valore a 0x18 è nuovo
+```
+
+### Quando viene scritto: la prova, non l'intenzione
+
+La domanda del gradino era *perché il registro di stato si aggiorna all'`ap_done`
+e non durante*. La risposta sta in due processi del top level, che vanno letti
+insieme:
+
+```vhdl
+-- l'impulso che carica il registro di stato
+sample_count_ap_vld_assign_proc : process(...)
+    if ((ap_loop_exit_ready_pp0_iter2_reg = '1') and
+        (phi_ln203_reg_123_pp0_iter1_reg = '0') and ...) then
+        sample_count_ap_vld <= '1';
+
+-- il segnale di fine transazione
+ap_done_int_assign_proc : process(...)
+    if ((ap_loop_exit_ready_pp0_iter2_reg = '1') and ...) then
+        ap_done_int <= '1';
+```
+
+**Lo stesso termine, `ap_loop_exit_ready_pp0_iter2_reg`, comanda tutti e due.**
+`phi_ln203` è il predicato di continuazione del `while` (riga 203 del sorgente),
+quindi la condizione dice: *siamo all'iterazione in cui il loop non continua*,
+cioè quella con `TLAST`.
+
+E qui sta il punto che vale la pena non fraintendere:
+
+> HLS non ha una regola "i registri di stato si aggiornano all'`ap_done`".
+> Ha una regola molto più semplice: **il registro viene scritto dove sta
+> l'assegnazione nel C**. Siccome la nostra assegnazione è l'ultima riga della
+> funzione, lo scheduler la mette dove la funzione finisce — e quello è, per
+> definizione, `ap_done`.
+
+La differenza è pratica, non filosofica: significa che la posizione di quella
+riga nel sorgente **è** una specifica temporale dell'hardware. Che è esattamente
+la cosa che a chi viene dal VHDL sembra troppo bella per essere vera, e per
+questo è meglio verificarla che crederci.
+
+### Esperimento A — e se scrivessimo il registro dentro il loop?
+
+Sintetizzata in scratchpad la variante con `*sample_count = conteggio;` dentro
+il ciclo, tutto il resto identico. Il diff è tutto nella condizione del valido:
+
+```vhdl
+-- assegnazione DOPO il loop (il nostro 1.4): un impulso per TRANSAZIONE
+if ((ap_loop_exit_ready_pp0_iter2_reg = '1') and (phi_ln203_reg_..._iter1_reg = '0') ...)
+
+-- assegnazione DENTRO il loop:              un impulso per BEAT
+if ((ap_enable_reg_pp0_iter2 = '1') and (phi_ln203_reg_..._iter1_reg = '1') ...)
+```
+
+Nel secondo caso sparisce il riferimento all'uscita dal loop e compare
+`ap_enable_reg_pp0_iter2`, cioè "la pipeline sta lavorando": il valido pulsa a
+**ogni campione**, non una volta sola.
+
+Il risultato dell'esperimento è però più interessante di così, e in due modi
+opposti a quello che verrebbe da pensare.
+
+**Non costa di più.** Anzi:
+
+| | FF | LUT |
+|---|---|---|
+| assegnazione fuori dal loop (1.4) | 298 | **343** |
+| assegnazione dentro il loop | 299 | **313** |
+
+Trenta LUT in meno. L'argomento "scrivilo fuori dal loop perché costa meno" è
+semplicemente falso, e se l'avessimo scritto senza provarlo sarebbe finito in
+questa documentazione come una cosa vera.
+
+**E non è nemmeno sbagliato.** Il valore finale nel registro è lo stesso: HLS
+genera esattamente *n* impulsi, uno per beat, e l'ultimo deposita *n*.
+
+Quello che si rompe è il **significato del bit di validità**. `_ap_vld` è un
+latch che si accende al primo impulso e resta acceso: se pulsa a ogni beat, si
+accende al primo campione del pacchetto. Un software che lo legge per sapere se
+il risultato è pronto riceve "sì" quando l'elaborazione è appena cominciata, e
+va a leggere un conteggio parziale. Il bit smette di voler dire *il risultato è
+pronto* e passa a voler dire *è passato almeno un campione* — che non è
+l'informazione che serve a nessuno.
+
+> La ragione per scrivere un registro di stato fuori dal loop è **semantica**,
+> non di risorse. E vale la pena saperlo per il verso giusto: l'intuizione
+> hardware ("un percorso attivo tutto il pacchetto deve costare") qui sbaglia.
+
+### Esperimento B — e se usassimo il valore di ritorno?
+
+L'altra domanda del gradino: *perché un'uscita deve essere un puntatore?* La
+risposta non è "perché non si può fare altrimenti". Sintetizzata anche questa
+variante, con `int axis_scaler(...)` che ritorna il conteggio:
+
+```c
+// xaxis_scaler_hw.h  --  variante con il valore di ritorno
+// 0x10 : Data signal of ap_return
+//        bit 31~0 - ap_return[31:0] (Read)
+// 0x18 : Data signal of gain
+//        bit 31~0 - gain[31:0] (Read/Write)
+// 0x1c : reserved
+```
+
+Funziona: HLS crea un registro `ap_return`. Ma guarda cosa è successo davvero.
+
+**1) `gain` si è spostato da 0x10 a 0x18.** Il valore di ritorno si prende il
+primo offset utente, **prima di tutti gli argomenti**. Cambiando la firma da
+puntatore a `return` abbiamo spostato l'indirizzo di un registro che non
+avevamo toccato: è esattamente il bug del gradino 1.3, con la differenza che
+qui nemmeno ci si accorge di aver riordinato qualcosa. Il codice compila, l'IP
+parte, e il driver scrive il guadagno in un registro di sola lettura.
+
+**2) Non c'è nessun `_ap_vld`.** Lo slot 0x14 resta vuoto, e il software non ha
+nessun modo di sapere se il valore letto è fresco. Il registro di stato di
+prima classe è quello col puntatore; `ap_return` è la versione povera.
+
+**3) In compenso il momento della scrittura è esplicito**, e questo chiude il
+discorso del paragrafo precedente nel modo più diretto possibile:
+
+```vhdl
+-- variante con il return: il banco registri usa ap_done COME ENABLE
+if (ap_done = '1') then
+    int_ap_return <= UNSIGNED(ap_return);
+end if;
+```
+
+Non uno schedule che *coincide* con `ap_done`: proprio il segnale `ap_done`
+cablato all'enable del registro.
+
+Quindi i due meccanismi, affiancati:
+
+| | chi carica il registro | c'è `_ap_vld`? | offset |
+|---|---|---|---|
+| `int *sample_count` | un impulso generato dallo scheduler dove sta l'assegnazione | **sì**, con latch COR | dopo gli argomenti precedenti |
+| `return conteggio` | il segnale `ap_done`, cablato | no | **prima** di tutti gli argomenti |
+
+E le tre ragioni per il puntatore, in ordine: il `return` è **uno solo** (avremo
+sette registri di stato), non ha **valido**, e occupa un offset che **sposta
+tutti gli altri**.
+
+Un'ultima nota sulla parola `return`, che è un omonimo sfortunato: nel pragma
+
+```cpp
+#pragma HLS INTERFACE mode=s_axilite port=return bundle=ctrl
+```
+
+`port=return` **non** indica il valore restituito, indica la funzione nel suo
+insieme, cioè il protocollo a livello di blocco (`ap_ctrl_hs`, gradino 1.2). Le
+due cose finiscono nello stesso bundle ma non sono la stessa cosa, e nei forum
+questa confusione gira parecchio.
+
+### Il contatore è a 31 bit, non a 32
+
+Dettaglio piccolo ma molto "HLS". Abbiamo scritto `int conteggio`, cioè 32 bit
+con segno. Nel VHDL generato:
+
+```vhdl
+signal conteggio_fu_78     : STD_LOGIC_VECTOR (30 downto 0);          -- 31 bit
+conteggio_1_fu_147_p2 <= std_logic_vector(unsigned(...) + unsigned(ap_const_lv31_1));
+sample_count <= std_logic_vector(resize(unsigned(conteggio_fu_78), 32));
+```
+
+e nel report:
+
+```text
+|conteggio_1_fu_147_p2  |  +  | 0| 0| 31|   31  |   1  |     <- sommatore a 31 bit
+|conteggio_fu_78        |     |31| 0| 31|                     <- 31 flip-flop
+```
+
+Il tool ha **ridotto la larghezza** del registro. Il ragionamento: la variabile
+parte da 0 e viene solo incrementata, e in C l'overflow di un intero con segno è
+comportamento indefinito — quindi il tool può assumere che non accada, e
+concludere che il valore non è mai negativo. Bit 31 sempre zero ⇒ non serve
+tenerlo. Quando il valore esce verso il banco registri viene esteso a 32 con uno
+zero davanti.
+
+È una differenza culturale netta rispetto al VHDL: lì se dichiari
+`unsigned(31 downto 0)` ottieni 32 flip-flop, punto. Qui il tool ti dà quello che
+riesce a dimostrare che ti serve. Comodo, ma con una conseguenza reale da sapere:
+**questo contatore avvolge a 2^31, non a 2^32** — un pacchetto di 2,1 miliardi di
+beat, che a 250 MHz sono 8,6 secondi di stream continuo. Remoto, non impossibile:
+è il genere di limite che va scritto nella scheda tecnica di una IP, ed è
+imparentato con il watchdog del gradino 1.9.
+
+### Il costo
+
+| | DSP | FF | LUT | II | Iter. latency | Estimated | Fmax |
+|---|---|---|---|---|---|---|---|
+| 1.2 | 0 | 40 | 52 | 1 | 2 | 0,761 ns | 1314 MHz |
+| 1.3 | 4 | 223 | 166 | 1 | 4 | 2,238 ns | 447 MHz |
+| 1.4 | 4 | **298** | **343** | **1** | **4** | **2,238 ns** | **446,8 MHz** |
+
+**Il timing non si è mosso di un picosecondo.** Stesso percorso critico: è
+ancora il moltiplicatore del gradino 1.3. Un sommatore a 31 bit e un registro in
+più non lo toccano nemmeno da lontano. Anche `II` e *iteration latency* sono
+invariati: il contatore ha una dipendenza portata dal loop (dipende da se stesso
+all'iterazione precedente), ma un'addizione sta comodamente in un ciclo, quindi
+l'incremento non ha costretto lo scheduler ad allargare l'II. Continua a entrare
+un campione ogni colpo di clock.
+
+Dove sono finiti i +75 FF e i +177 LUT:
+
+```text
+                            1.3           1.4          differenza
+ctrl_s_axi_U            74 FF / 104 LUT   112 / 168    +38 FF / +64 LUT
+Expression               0 FF /   6 LUT     0 /  51            +45 LUT
+Multiplexer              0 FF /   4 LUT     0 /  70            +66 LUT
+Register               103 FF /  10 LUT   140 /  12    +37 FF /  +2 LUT
+```
+
+- **ctrl_s_axi (+38 FF)**: il registro dato a 32 bit, il latch `_ap_vld`, e la
+  decodifica dei due indirizzi nuovi. Coerente col gradino 1.3, dove `gain` era
+  costato +38 FF esatti.
+- **Expression (+45 LUT)**: 31 sono il sommatore, il resto sono le condizioni di
+  controllo in più.
+- **Register (+37 FF)**: 31 sono il contatore, gli altri il predicato di uscita
+  del loop e i suoi registri di pipeline.
+- **Multiplexer (+66 LUT)**: la voce più grossa, e la meno ovvia. Sono due
+  multiplexer a 31 bit sul contatore:
+
+  ```text
+  |ap_sig_allocacmp_conteggio_load  | 32 LUT |
+  |conteggio_fu_78                  | 32 LUT |
+  ```
+
+  Servono a scegliere fra "azzera" e "incrementa" all'inizio di ogni
+  transazione. In VHDL quell'azzeramento l'avresti quasi certamente messo nel
+  ramo di reset del process, che non costa logica. Qui non può stare lì, perché
+  `conteggio` è un registro di **dato** e in `hls_config.cfg` abbiamo
+  `syn.rtl.reset=control`: il reset globale tocca solo i registri di controllo.
+  L'azzeramento deve quindi passare dal datapath, e passa da un mux.
+
+  È una osservazione, non ancora una conclusione: al **gradino 1.7** faremo
+  l'esperimento vero, `reset=control` contro `reset=state`, con il diff del
+  VHDL sotto gli occhi.
+
+Una curiosità del report, per non restarci male guardandolo: nella tabella
+*Interface* la colonna `C Type` delle righe `s_axi_ctrl_*` è passata da
+`scalar` a `pointer`. Non è cambiata l'interfaccia — è che quella colonna
+descrive il bundle, e il bundle adesso contiene anche un argomento puntatore.
+
+### Il testbench: verificare un'uscita che non sta sullo stream
+
+Il testbench cresce in tre punti, e tutti e tre rispondono alla stessa regola:
+
+> Una uscita non verificata è una uscita che non esiste.
+
+**1) Il golden model del conteggio non usa `n_campioni`.** Sarebbe stato ovvio
+scrivere `atteso = n_campioni`, ma è la stessa trappola del gradino 1.3: il
+valore atteso verrebbe da dove viene lo stimolo, non da un calcolo indipendente.
+Il modello conta invece i beat del vettore di stimoli fino al primo `TLAST`
+incluso — cioè guarda il bus come lo guarderebbe un osservatore esterno. Se un
+giorno uno stimolo mettesse `TLAST` a metà pacchetto, il DUT si fermerebbe lì e
+il modello anche; con `n_campioni` il test darebbe la colpa alla IP.
+
+**2) La variabile viene sporcata prima della chiamata**, con un valore
+impossibile (`-999999`: un conteggio di campioni non è mai negativo).
+
+```cpp
+int sample_count = SPORCO;
+axis_scaler(s_axis, m_axis, gain, &sample_count);
+if (sample_count == SPORCO) { /* la IP non ha scritto l'uscita */ }
+```
+
+Se lo lasciassimo a zero, un DUT che non scrive mai il registro passerebbe il
+test su ogni pacchetto vuoto. È la controparte software del bit `_ap_vld`, che
+in hardware esiste per distinguere la stessa identica cosa: *valore vero* da
+*valore mai scritto*.
+
+**3) Due transazioni consecutive di lunghezza diversa** (3 poi 5), per fissare
+che il conteggio **non si accumula**: `conteggio` è una variabile locale, quindi
+riparte da zero a ogni `ap_start`, e il registro riporta la lunghezza
+dell'ultimo pacchetto. Al gradino 1.7 introdurremo variabili `static` per le
+statistiche cumulative, e questo test è il paletto che dice che quel cambiamento
+non deve toccare *questo* registro.
+
+Nove casi, tutti verdi:
+
+```text
+--- 1 campioni, gain = 2  (pacchetto minimo: TLAST sul primo beat) ---
+  OK: 1 campioni scalati, TLAST e TKEEP intatti, sample_count = 1
+...
+--- 3 campioni, gain = 2  (prima transazione: sample_count deve dare 3) ---
+  OK: 3 campioni scalati, TLAST e TKEEP intatti, sample_count = 3
+--- 5 campioni, gain = 2  (seconda transazione: deve dare 5, non 8) ---
+  OK: 5 campioni scalati, TLAST e TKEEP intatti, sample_count = 5
+
+ RISULTATO: PASS  (0 errori)
+```
+
+Da ricordare però, perché è il limite di questo gradino: **la C simulation non
+ha verificato niente di tutto quello che abbiamo appena letto nel VHDL**. Non
+esistono 0x18 e 0x1c, non esiste `_ap_vld`, e `sample_count` è un puntatore a
+una variabile dello stack. Che quel puntatore diventi un registro a 0x18 con un
+bit di validità a 0x1c lo verificheranno la cosimulation (Fase 3) e la
+simulazione del block design con gli AXI VIP (Fase 5).

@@ -2,25 +2,26 @@
 //  axis_scaler.hpp  --  Tipi e dichiarazione dell'IP
 // =============================================================================
 //
-//  GRADINO 1.3 della costruzione incrementale.
+//  GRADINO 1.4 della costruzione incrementale.
 //
-//  LA NOVITA': il primo registro di CONFIGURAZIONE.
+//  LA NOVITA': il primo registro di STATO.
 //
-//  Fino al gradino 1.2 questo file non era mai cambiato: la firma della
-//  funzione era sempre stata la stessa, perche' il banco registri AXI4-Lite
-//  conteneva solo i segnali di controllo del blocco (ap_start, ap_done, ...),
-//  che in C non sono argomenti.
+//  Al gradino 1.3 abbiamo aggiunto "gain": un registro che il SOFTWARE scrive e
+//  l'HARDWARE legge. Ora facciamo il viaggio opposto:
 //
-//  Ora cambia, ed e' il punto centrale del gradino:
+//        un registro che l'HARDWARE scrive e il SOFTWARE legge
 //
-//        UN REGISTRO DI CONFIGURAZIONE = UN ARGOMENTO DELLA FUNZIONE
+//  Contiamo quanti campioni aveva il pacchetto appena elaborato, e lo rendiamo
+//  leggibile dal bus. E' la prima informazione che esce dalla IP senza passare
+//  dallo stream.
 //
-//  Aggiungiamo "gain": un intero che il software scrive in un registro, e che
-//  l'IP usa per moltiplicare ogni campione. Da qui in avanti ogni registro
-//  nuovo sara' un argomento nuovo in questa riga.
+//  La riga che cambia e' una sola, e sta nel prototipo qui sotto:
 //
-//  Obiettivo del gradino: sintetizzare e scoprire DOVE finisce quel registro
-//  nella mappa degli indirizzi, e chi decide quel "dove".
+//        int  gain          ->  ingresso,  si passa PER VALORE
+//        int *sample_count  ->  uscita,    si passa PER PUNTATORE
+//
+//  Obiettivo del gradino: capire perche' quell'asterisco e' obbligatorio, e
+//  scoprire cosa compare nella mappa registri accanto al valore.
 //
 // =============================================================================
 #ifndef AXIS_SCALER_HPP
@@ -116,7 +117,7 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 //
 //  Questa e' la "top function": e' l'equivalente della tua entity VHDL.
 //  Il nome della funzione diventera' il nome del modulo RTL, e i suoi
-//  argomenti diventeranno le porte.
+//  argomenti diventeranno le porte (o, per quelli su s_axilite, i registri).
 //
 //  Gli stream si passano SEMPRE per riferimento (&). Non e' uno stile: e' un
 //  requisito. Uno stream e' un canale fisico, non un valore da copiare; se lo
@@ -124,34 +125,93 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 //  infatti la sintesi si rifiuterebbe.
 //
 //  --------------------------------------------------------------------------
-//  IL NUOVO ARGOMENTO: gain
+//  IL NUOVO ARGOMENTO: sample_count -- e perche' ha un asterisco
 //  --------------------------------------------------------------------------
-//  Al contrario degli stream, "gain" si passa PER VALORE (senza &). Anche
-//  questa non e' una scelta stilistica, dice una cosa precisa al tool:
 //
-//        per valore   -> e' un INGRESSO, letto una volta. Diventa un registro
-//                        di sola scrittura dal lato software.
-//        per puntatore o riferimento -> potrebbe essere anche un'USCITA, e il
-//                        tool deve generare la logica per scriverlo.
+//  Al gradino 1.3 avevamo anticipato la regola, ora la usiamo:
 //
-//  Il gradino 1.4 usera' proprio un puntatore per il primo registro di STATO,
-//  e li' si vedra' la differenza nell'RTL. Per ora: per valore = ingresso.
+//        per VALORE     (int gain)          -> il tool lo puo' solo LEGGERE
+//                                              => registro di sola scrittura
+//                                                 dal lato software (config)
 //
-//  Perche' "int" e non ap_int<32>? Perche' un registro AXI4-Lite e' comunque
-//  largo 32 bit, e "int" e' il tipo che il driver software usera' dall'altro
-//  lato del bus. Tenere lo stesso tipo su entrambi i lati evita conversioni
-//  implicite di cui poi non ti ricordi. Al gradino 1.6 diventera' un
-//  ap_fixed<16,2>, e allora il discorso cambiera' radicalmente.
+//        per PUNTATORE  (int *sample_count) -> il tool lo puo' anche SCRIVERE
+//                                              => registro di sola lettura
+//                                                 dal lato software (stato)
 //
-//  ORDINE DEGLI ARGOMENTI: non e' indifferente.
-//  L'ordine in cui compaiono qui determina l'ordine con cui HLS assegna gli
-//  OFFSET nella mappa registri. Cambiare l'ordine degli argomenti cambia gli
-//  indirizzi, e quindi rompe il driver software scritto per la versione
-//  precedente. Per questo l'ordine, una volta scelto, si congela.
+//  E qui sta il punto didattico del gradino, che merita di essere detto
+//  esplicitamente perche' e' controintuitivo per chi arriva dal VHDL.
+//
+//  IL TOOL NON DECIDE LA DIREZIONE DELLE PORTE GUARDANDO I PRAGMA.
+//  La deduce dal C, esattamente come farebbe un compilatore software:
+//
+//    - un argomento passato per valore e' una COPIA locale. Qualunque cosa tu
+//      ci scriva dentro muore quando la funzione ritorna: il chiamante non la
+//      vedra' mai. Quindi non ha senso generare la logica per riportarla
+//      indietro -> porta di ingresso, punto.
+//
+//    - un argomento passato per puntatore e' un INDIRIZZO. Scriverci dentro
+//      modifica qualcosa che vive fuori dalla funzione, e che il chiamante
+//      rileggera'. Quindi il tool deve generare la logica di scrittura
+//      -> porta (o registro) di uscita.
+//
+//  Non e' una convenzione di HLS: e' la semantica del C presa alla lettera e
+//  tradotta in fili. Il pragma INTERFACE dice soltanto DOVE finisce quella
+//  porta (dentro il bus AXI4-Lite), non in che DIREZIONE va.
+//
+//  --------------------------------------------------------------------------
+//  "MA NON POTEVA ESSERE IL VALORE DI RITORNO?"
+//  --------------------------------------------------------------------------
+//  E' la domanda giusta, perche' in C il modo naturale di restituire UN valore
+//  e' proprio "return". E la risposta non e' "non si puo'": HLS un valore di
+//  ritorno lo sa gestire eccome, lo chiama "ap_return". Le ragioni sono altre,
+//  e sono tre, in ordine di importanza.
+//
+//   1) IL RETURN E' UNO SOLO. La nostra IP finira' per avere sette registri di
+//      stato (campioni, pacchetti, min, max, saturazioni, sopra-soglia, flag).
+//      Con "return" ne restituiresti uno; gli altri sei sarebbero comunque
+//      puntatori. Un meccanismo che non scala non e' il meccanismo giusto
+//      nemmeno per il primo caso.
+//
+//   2) IL "port=return" E' GIA' OCCUPATO, e non dal valore di ritorno.
+//      Nel pragma
+//
+//            #pragma HLS INTERFACE mode=s_axilite port=return bundle=ctrl
+//
+//      la parola "return" non indica il valore restituito: indica LA FUNZIONE
+//      NEL SUO INSIEME, cioe' il protocollo a livello di blocco
+//      (ap_start/ap_done/ap_idle/ap_ready, il gradino 1.2). E' un omonimo
+//      sfortunato nella sintassi di HLS, e vale la pena saperlo perche' nei
+//      forum genera confusione a ripetizione.
+//
+//   3) UN REGISTRO DI STATO NON E' UN "RISULTATO". Un valore di ritorno, in C,
+//      e' il risultato dell'elaborazione. Un registro di stato e' un
+//      sottoprodotto osservabile: puoi leggerlo o ignorarlo, e la IP funziona
+//      lo stesso. Il puntatore descrive meglio la cosa anche a chi legge il
+//      codice.
+//
+//  --------------------------------------------------------------------------
+//  ORDINE DEGLI ARGOMENTI: la regola del gradino 1.3 vale ancora
+//  --------------------------------------------------------------------------
+//  sample_count va IN FONDO, dopo gain. Non e' indifferente: e' l'ordine degli
+//  argomenti a decidere gli offset nella mappa registri, quindi
+//
+//        aggiungere in fondo  -> gli offset gia' esistenti NON si spostano
+//        inserire in mezzo    -> tutto quello che segue trasla, e ogni driver
+//                                scritto prima scrive nel registro sbagliato
+//
+//  E' la stessa regola "append-only" con cui si estendono i protocolli e i
+//  formati di file: si aggiunge in coda, non si rimescola. Da qui in avanti
+//  ogni registro nuovo andra' in fondo alla lista.
+//
+//  Perche' il nome e' in inglese, in mezzo a commenti italiani? Perche' NON e'
+//  un nome interno: HLS lo trasforma nel nome di una macro del driver
+//  (XAXIS_SCALER_CTRL_ADDR_SAMPLE_COUNT_DATA). E' API pubblica verso il
+//  software, e sta insieme al resto dei nomi generati dal tool.
 //  --------------------------------------------------------------------------
 //
 void axis_scaler(hls::stream<pkt_t> &s_axis,
                  hls::stream<pkt_t> &m_axis,
-                 int                 gain);
+                 int                 gain,
+                 int                *sample_count);
 
 #endif // AXIS_SCALER_HPP
