@@ -144,6 +144,24 @@ lasciando TLAST. Non facciamolo ora: è annotato qui perché è una cosa che si
 Questo è il file che il compilatore include davvero. Un manuale può essere di
 un'altra versione; questo no.
 
+### 1d. Librerie di dominio ed esempi, già installati
+
+Trovati cercando materiale per le domande raccolte in `docs/05`. Utile sapere che
+esistono, prima di riscrivere a mano qualcosa che c'è già.
+
+| Percorso | Cosa è |
+|---|---|
+| `Vitis/include/hls_fir.h` | libreria HLS che avvolge il **FIR Compiler IP** di AMD: l'equivalente di istanziare il core del vendor invece di scrivere il tap delay line a mano |
+| `Vitis/include/fir/fir_compiler_v7_2_bitacc_cmodel.h` | il modello bit-accurate dietro `hls::fir` |
+| `Vitis/include/ap_fixed.h` | `ap_fixed<W,I,Q,O>` — gradino 1.6 |
+| `Vitis/include/hls_vector.h` | tipo vettoriale, per il parallelismo di `docs/05` §1 |
+| `Vitis/samples/template_window_class/src/fir.cpp` | un FIR con tap delay line — **attenzione: è AI Engine** (`adf::input_buffer`), non HLS. Il pattern è identico, il target no |
+| `Vitis/samples/aie_system_examples/` | esempi di sistema AI Engine |
+
+La distinzione AIE/HLS su quel `fir.cpp` vale la pena tenerla a mente: cercando
+"fir" nell'installazione, il primo risultato leggibile è codice per una
+architettura diversa. Il `#include "adf.h"` in testa è il segnale.
+
 ---
 
 ## 2. I documenti online, per numero

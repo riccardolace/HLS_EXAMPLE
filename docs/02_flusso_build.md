@@ -208,3 +208,81 @@ esplicitamente quel passo, tipicamente dopo aver cambiato i metadati
 Nota sui nomi: lo `.zip` si chiama ancora `xilinx_com_hls_axis_scaler_1_0.zip`
 perché non abbiamo ancora impostato `package.ip.vendor`. Il VLNV definitivo
 (`riclab.io:hls:axis_scaler:1.0`) arriverà in Fase 4.
+
+---
+
+## 8. L'esperimento isolato: provare una variante senza toccare il progetto
+
+Capita spesso di doversi rispondere a una domanda del tipo *"e se invece
+usassi…?"* senza sporcare `src/`, senza far ripartire il workspace e senza
+perdere gli artefatti del gradino in corso. Le risposte di `docs/05` sono state
+prodotte tutte così.
+
+La ricetta è un **component HLS usa-e-getta**, fatto di due file soli:
+
+```bash
+SCRATCH=/tmp/prova           # o la cartella che preferisci
+
+mkdir -p $SCRATCH/src
+cp src/axis_scaler.hpp $SCRATCH/src/
+# ... poi modifica la variante che ti interessa in $SCRATCH/src/
+```
+
+Il `hls_config.cfg` è identico a quello del progetto, con **una sola
+differenza**: i percorsi dei sorgenti sono assoluti invece che relativi, così il
+file non dipende da dove si trova.
+
+```ini
+part=xcvc1902-vsva2197-2MP-e-S
+
+[hls]
+flow_target=vivado
+package.output.format=ip_catalog
+syn.file=/tmp/prova/src/axis_scaler.cpp     # <- assoluto
+syn.top=axis_scaler
+clock=4.0
+syn.rtl.reset=control
+syn.rtl.reset_level=low
+```
+
+Nota che **manca `tb.file`**: per la sola sintesi non serve un testbench, e
+ometterlo rende l'esperimento più rapido da montare. Ovviamente questo vale solo
+per gli esperimenti: nel progetto vero la regola resta *non si sintetizza finché
+`make csim` non è verde*.
+
+Poi:
+
+```bash
+source /tools/Xilinx/2025.2/Vitis/settings64.sh
+cd /tmp/prova && v++ -c --mode hls --config hls_config.cfg --work_dir prova
+```
+
+Una sintesi di un componente piccolo costa **20-30 secondi**. I risultati
+finiscono in `/tmp/prova/prova/hls/`, con la stessa struttura del progetto
+(`syn/vhdl/`, `syn/report/`, `impl/ip/drivers/`), quindi tutte le tecniche di
+ispezione del §7 valgono identiche.
+
+### Cosa guardare, in ordine di utilità
+
+```bash
+RPT=$(find /tmp/prova/prova/hls/syn/report -name "*_csynth.rpt")
+
+grep -E "ap_clk  \|" $RPT              # percorso critico stimato
+grep -A3 "Loop Name" $RPT              # II, iteration latency, pipelined sì/no
+grep "^|Total " $RPT                   # DSP / FF / LUT
+grep -c "constant ap_ST_" /tmp/prova/prova/hls/syn/vhdl/*.vhd   # stati della FSM
+```
+
+Quell'ultimo conteggio degli stati è più informativo di quanto sembri: è il modo
+più rapido per accorgersi che il tool ha cambiato **struttura**, non solo
+dimensioni (vedi `docs/05` §3, dove 3 stati contro 6 distinguono una pipeline che
+regge da una che si è rotta).
+
+### Le due regole di questo metodo
+
+1. **Una variante = un componente.** Non si modifica il componente esistente e
+   poi si torna indietro: si creano cartelle sorelle (`prova_a`, `prova_b`) e si
+   confrontano i report. Così il "prima" esiste ancora quando serve.
+2. **Gli esperimenti non entrano in `git`.** Vivono in scratchpad e spariscono
+   con la sessione. Quello che resta è il *risultato*, scritto in `docs/` con i
+   numeri veri — perché fra sei mesi servirà la conclusione, non i file.
