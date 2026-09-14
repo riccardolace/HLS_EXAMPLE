@@ -2,20 +2,27 @@
 //  axis_scaler.hpp  --  Tipi e dichiarazione dell'IP
 // =============================================================================
 //
-//  GRADINO 1.5 della costruzione incrementale.
+//  GRADINO 1.6 della costruzione incrementale.
 //
-//  QUESTO FILE NON CAMBIA, ed e' un fatto da notare. Il gradino aggiunge
-//  #pragma HLS PIPELINE nel .cpp, e un pragma di pipeline riguarda COME viene
-//  schedulato un loop, non COSA il modulo espone al mondo. La firma della
-//  funzione -- cioe' la entity -- e' la stessa del gradino 1.4. Vale la
-//  regola: i pragma di INTERFACE cambiano le porte, i pragma di ottimizzazione
-//  (PIPELINE, UNROLL, ALLOCATION...) cambiano solo quello che sta dentro.
+//  LA NOVITA': il guadagno diventa un numero in VIRGOLA FISSA, e il prodotto
+//  viene ARROTONDATO e SATURATO invece che troncato.
 //
-//  Il prototipo qui sotto e' quindi ancora quello del 1.4, con i suoi due
-//  argomenti scalari in direzioni opposte:
+//  Fino al 1.5 "gain" era un int: y = x * 3 si poteva fare, y = x * 0.5 no.
+//  Un guadagno che non puo' valere 0.5 non e' un guadagno, e' un contatore.
+//  In hardware pero' i numeri reali non esistono: esistono bit, e una
+//  convenzione su dove sta la virgola. Quella convenzione e' il tipo ap_fixed,
+//  ed e' l'equivalente diretto di sfixed di ieee.fixed_pkg.
 //
-//        int  gain          ->  ingresso,  si passa PER VALORE
-//        int *sample_count  ->  uscita,    si passa PER PUNTATORE
+//  Tre tipi nuovi, qui sotto, che raccontano il viaggio di un campione:
+//
+//        gain_t   Q2.14, 16 bit       il guadagno, come arriva dal registro
+//        prod_t   Q34.14, 48 bit      il prodotto ESATTO: 32 + 16 bit, nessuna perdita
+//        out_t    32 bit interi       il campione in uscita: e' QUI che si decide
+//                 AP_RND, AP_SAT      cosa fare dei bit che non ci stanno
+//
+//  Il prototipo cambia in un solo punto: il tipo di gain. La entity no -- e
+//  questa e' la previsione da verificare: il registro a 0x10 dovrebbe passare
+//  da 32 a 16 bit utili, e i DSP da 4 a 2.
 //
 // =============================================================================
 #ifndef AXIS_SCALER_HPP
@@ -29,6 +36,7 @@
 //  quando compila per la simulazione C sia quando sintetizza.
 // -----------------------------------------------------------------------------
 #include <ap_int.h>        // ap_int<N> / ap_uint<N> : interi di larghezza arbitraria
+#include <ap_fixed.h>      // ap_fixed<W,I,Q,O>      : virgola fissa (NUOVO, gradino 1.6)
 #include <hls_stream.h>    // hls::stream<T>         : la coda con handshake
 #include <ap_axi_sdata.h>  // ap_axis / hls::axis    : il "pacchetto" AXI4-Stream
 
@@ -106,7 +114,99 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 
 
 // =============================================================================
-//  3) IL PROTOTIPO DELLA FUNZIONE TOP
+//  3) I TIPI IN VIRGOLA FISSA  (la novita' del gradino 1.6)
+// =============================================================================
+//
+//  ap_fixed<W, I, Q, O> e' un numero con segno su W bit, di cui I sono la
+//  parte intera (segno compreso) e W-I la parte frazionaria. La virgola non
+//  esiste nei fili: e' una convenzione su come LEGGERE i bit, esattamente come
+//  in VHDL con ieee.fixed_pkg:
+//
+//        ap_fixed<16, 2>      <->     sfixed(1 downto -14)
+//
+//        bit:   15    14  |  13 ........ 0
+//               segno  1  |  1/2 1/4 ... 1/16384
+//               \__ I=2 __/ \_____ W-I = 14 _____/
+//
+//  Q e O sono la novita' vera, e sono due DECISIONI che in VHDL scriveresti a
+//  mano con un if:
+//
+//        Q  (quantizzazione)  cosa fare dei bit frazionari che NON ci stanno
+//                             AP_TRN  tronca (default: floor, verso -inf)
+//                             AP_RND  arrotonda al piu' vicino, meta' -> +inf
+//
+//        O  (overflow)        cosa fare se il valore e' piu' grande del massimo
+//                             AP_WRAP avvolge (default: come un contatore)
+//                             AP_SAT  satura al massimo / al minimo
+//
+//  REGOLA CHE VALE LA PENA FISSARE: Q e O NON sono proprieta' di un'operazione,
+//  sono proprieta' del TIPO DI DESTINAZIONE. Agiscono nel momento in cui un
+//  valore viene ASSEGNATO a una variabile di quel tipo, e solo se non ci sta.
+//  Il prodotto in se' e' sempre esatto. Per questo qui ci sono tre tipi e non
+//  uno: raccontano DOVE, lungo il percorso del campione, i bit si perdono.
+// -----------------------------------------------------------------------------
+
+//  --- Il guadagno: Q2.14 ------------------------------------------------------
+//
+//  16 bit, 2 interi: range [-2, +2), risoluzione 2^-14 = 0.000061.
+//  Il massimo NON e' 2.0 ma 2 - 2^-14 = 1.99993896. E' il formato scelto
+//  nel piano ("GAIN, Q2.14 signed").
+//
+//  Nessun modo Q/O qui, e non e' una dimenticanza: gain e' un INGRESSO. In
+//  hardware nessun valore viene mai convertito "dentro" gain_t: arrivano 16
+//  bit dal registro e vengono letti cosi' come sono. La quantizzazione di un
+//  numero reale in Q2.14 e' un lavoro del SOFTWARE -- del driver, e qui del
+//  testbench -- che moltiplica per 16384 e arrotonda PRIMA di scrivere il
+//  registro. Il registro trasporta bit grezzi.
+//
+//  ATTENZIONE, verificato con il compilatore: gain_t g = 2.0; NON da' un
+//  errore. Con il default AP_WRAP, 2.0 avvolge a -2.0 (bit 0x8000) in
+//  silenzio. Un driver che scrive "2.0" nel registro inverte il segno del
+//  segnale. Il range check lo deve fare chi quantizza.
+//
+typedef ap_fixed<16, 2> gain_t;
+
+//  --- Il prodotto esatto: Q34.14 ---------------------------------------------
+//
+//  La CRESCITA DEI BIT. Un intero a 32 bit per un Q2.14 a 16 bit da' un
+//  Q34.14 a 48 bit, e in quel formato il prodotto e' ESATTO, per qualunque
+//  coppia di operandi. Le regole sono quelle di fixed_pkg:
+//
+//        W  = 32 + 16 = 48               sfixed(31 downto 0) * sfixed(1 downto -14)
+//        I  = 32 +  2 = 34                     = sfixed(33 downto -14)
+//
+//  Il tipo lo dichiariamo esplicito per leggibilita', ma il compilatore lo
+//  calcola da solo: e' il tipo naturale di "ap_int<32> * ap_fixed<16,2>"
+//  (verificato: W=48, I=34). Nessun modo Q/O: qui non si perde niente.
+//
+typedef ap_fixed<48, 34> prod_t;
+
+//  --- Il campione in uscita: 32 bit interi, con arrotondamento e saturazione --
+//
+//  ap_fixed<32, 32> e' un intero a 32 bit "visto come virgola fissa senza
+//  parte frazionaria": lo stesso contenuto di ap_int<32>, ma con i modi Q e O.
+//  E' il tipo a cui viene ASSEGNATO il prodotto, quindi e' qui che i 48 bit
+//  diventano 32, e qui che valgono i modi:
+//
+//        i 14 bit frazionari spariscono   ->  AP_RND: arrotonda, non tronca
+//        i 2 bit interi in piu' spariscono ->  AP_SAT: satura, non avvolge
+//
+//  In VHDL sarebbe   resize(prodotto, 31, 0, fixed_saturate, fixed_round)
+//  di fixed_pkg: gli stessi due parametri, con gli stessi nomi.
+//
+//  COSA PRODUCONO FISICAMENTE, previsione da verificare nell'RTL:
+//    AP_RND  ->  un sommatore che aggiunge 2^13 (mezzo LSB) prima di
+//                scartare i 14 bit bassi. Non serve guardare i bit 0..12:
+//                solo il bit 13 decide il riporto;
+//    AP_SAT  ->  un confronto sui bit alti del prodotto (sono tutti uguali
+//                al segno? allora ci sta) e un mux a 32 bit che sceglie fra il
+//                valore, 0x7FFFFFFF e 0x80000000.
+//
+typedef ap_fixed<32, 32, AP_RND, AP_SAT> out_t;
+
+
+// =============================================================================
+//  4) IL PROTOTIPO DELLA FUNZIONE TOP
 // =============================================================================
 //
 //  Questa e' la "top function": e' l'equivalente della tua entity VHDL.
@@ -119,93 +219,49 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 //  infatti la sintesi si rifiuterebbe.
 //
 //  --------------------------------------------------------------------------
-//  L'ARGOMENTO sample_count (gradino 1.4) -- e perche' ha un asterisco
+//  LA MODIFICA DEL GRADINO 1.6: il tipo di gain
 //  --------------------------------------------------------------------------
 //
-//  Al gradino 1.3 avevamo anticipato la regola, al 1.4 l'abbiamo usata:
+//        int     gain    ->    gain_t  gain
 //
-//        per VALORE     (int gain)          -> il tool lo puo' solo LEGGERE
-//                                              => registro di sola scrittura
-//                                                 dal lato software (config)
+//  Stesso argomento, stessa posizione, stesso pragma nel .cpp. Cambia solo il
+//  tipo, e con il tipo cambia la LARGHEZZA del registro: 16 bit invece di 32.
+//  Il banco registri AXI4-Lite resta a parole da 32 bit -- il bus e' quello --
+//  ma nell'header generato ci aspettiamo che 0x10 documenti solo i bit 15..0.
+//  Il tool prende la larghezza dal tipo C, come al gradino 1.1 la prendeva da
+//  C_DATA_WIDTH per TDATA. Niente e' scritto a mano.
 //
+//  --------------------------------------------------------------------------
+//  Le due regole dei gradini 1.3 e 1.4, che valgono ancora
+//  --------------------------------------------------------------------------
+//
+//  DIREZIONE: la decide il C, non il pragma.
+//
+//        per VALORE     (gain_t gain)       -> il tool lo puo' solo LEGGERE
+//                                              => registro scritto dal software
 //        per PUNTATORE  (int *sample_count) -> il tool lo puo' anche SCRIVERE
-//                                              => registro di sola lettura
-//                                                 dal lato software (stato)
+//                                              => registro letto dal software
 //
-//  E qui sta il punto didattico del gradino, che merita di essere detto
-//  esplicitamente perche' e' controintuitivo per chi arriva dal VHDL.
+//  Un argomento per valore e' una copia locale: scriverci dentro non arriva
+//  al chiamante, quindi non ha senso generare la logica per riportarlo
+//  indietro. Un puntatore e' un indirizzo: scriverci modifica qualcosa fuori.
+//  Il pragma INTERFACE dice DOVE finisce la porta, non in che VERSO va.
+//  (Perche' non un valore di ritorno: docs/00 par. 7, esperimento B -- il
+//  return e' uno solo, non ha bit di valido, e sposta gli offset degli altri.)
 //
-//  IL TOOL NON DECIDE LA DIREZIONE DELLE PORTE GUARDANDO I PRAGMA.
-//  La deduce dal C, esattamente come farebbe un compilatore software:
+//  ORDINE: e' l'ordine degli argomenti a decidere gli offset nella mappa
+//  registri. Si aggiunge in fondo, non si rimescola ("append-only"): inserire
+//  in mezzo trasla tutto quello che segue e ogni driver scritto prima scrive
+//  nel registro sbagliato, senza errori visibili.
 //
-//    - un argomento passato per valore e' una COPIA locale. Qualunque cosa tu
-//      ci scriva dentro muore quando la funzione ritorna: il chiamante non la
-//      vedra' mai. Quindi non ha senso generare la logica per riportarla
-//      indietro -> porta di ingresso, punto.
-//
-//    - un argomento passato per puntatore e' un INDIRIZZO. Scriverci dentro
-//      modifica qualcosa che vive fuori dalla funzione, e che il chiamante
-//      rileggera'. Quindi il tool deve generare la logica di scrittura
-//      -> porta (o registro) di uscita.
-//
-//  Non e' una convenzione di HLS: e' la semantica del C presa alla lettera e
-//  tradotta in fili. Il pragma INTERFACE dice soltanto DOVE finisce quella
-//  porta (dentro il bus AXI4-Lite), non in che DIREZIONE va.
-//
-//  --------------------------------------------------------------------------
-//  "MA NON POTEVA ESSERE IL VALORE DI RITORNO?"
-//  --------------------------------------------------------------------------
-//  E' la domanda giusta, perche' in C il modo naturale di restituire UN valore
-//  e' proprio "return". E la risposta non e' "non si puo'": HLS un valore di
-//  ritorno lo sa gestire eccome, lo chiama "ap_return". Le ragioni sono altre,
-//  e sono tre, in ordine di importanza.
-//
-//   1) IL RETURN E' UNO SOLO. La nostra IP finira' per avere sette registri di
-//      stato (campioni, pacchetti, min, max, saturazioni, sopra-soglia, flag).
-//      Con "return" ne restituiresti uno; gli altri sei sarebbero comunque
-//      puntatori. Un meccanismo che non scala non e' il meccanismo giusto
-//      nemmeno per il primo caso.
-//
-//   2) IL "port=return" E' GIA' OCCUPATO, e non dal valore di ritorno.
-//      Nel pragma
-//
-//            #pragma HLS INTERFACE mode=s_axilite port=return bundle=ctrl
-//
-//      la parola "return" non indica il valore restituito: indica LA FUNZIONE
-//      NEL SUO INSIEME, cioe' il protocollo a livello di blocco
-//      (ap_start/ap_done/ap_idle/ap_ready, il gradino 1.2). E' un omonimo
-//      sfortunato nella sintassi di HLS, e vale la pena saperlo perche' nei
-//      forum genera confusione a ripetizione.
-//
-//   3) UN REGISTRO DI STATO NON E' UN "RISULTATO". Un valore di ritorno, in C,
-//      e' il risultato dell'elaborazione. Un registro di stato e' un
-//      sottoprodotto osservabile: puoi leggerlo o ignorarlo, e la IP funziona
-//      lo stesso. Il puntatore descrive meglio la cosa anche a chi legge il
-//      codice.
-//
-//  --------------------------------------------------------------------------
-//  ORDINE DEGLI ARGOMENTI: la regola del gradino 1.3 vale ancora
-//  --------------------------------------------------------------------------
-//  sample_count va IN FONDO, dopo gain. Non e' indifferente: e' l'ordine degli
-//  argomenti a decidere gli offset nella mappa registri, quindi
-//
-//        aggiungere in fondo  -> gli offset gia' esistenti NON si spostano
-//        inserire in mezzo    -> tutto quello che segue trasla, e ogni driver
-//                                scritto prima scrive nel registro sbagliato
-//
-//  E' la stessa regola "append-only" con cui si estendono i protocolli e i
-//  formati di file: si aggiunge in coda, non si rimescola. Da qui in avanti
-//  ogni registro nuovo andra' in fondo alla lista.
-//
-//  Perche' il nome e' in inglese, in mezzo a commenti italiani? Perche' NON e'
-//  un nome interno: HLS lo trasforma nel nome di una macro del driver
-//  (XAXIS_SCALER_CTRL_ADDR_SAMPLE_COUNT_DATA). E' API pubblica verso il
-//  software, e sta insieme al resto dei nomi generati dal tool.
+//  I nomi degli argomenti sono in inglese perche' NON sono nomi interni: HLS
+//  li trasforma in macro del driver (XAXIS_SCALER_CTRL_ADDR_GAIN_DATA). Sono
+//  API pubblica verso il software.
 //  --------------------------------------------------------------------------
 //
 void axis_scaler(hls::stream<pkt_t> &s_axis,
                  hls::stream<pkt_t> &m_axis,
-                 int                 gain,
+                 gain_t              gain,
                  int                *sample_count);
 
 #endif // AXIS_SCALER_HPP

@@ -5,7 +5,7 @@ dati **AXI4-Stream** e banco registri **AXI4-Lite** (configurazione, stato,
 controllo, interrupt), fino a farla entrare nel catalogo IP di Vivado come una
 IP AMD.
 
-**Stato attuale: gradino 1.5 — controllo esplicito del pipeline.**
+**Stato attuale: gradino 1.6 — virgola fissa, arrotondamento e saturazione.**
 
 ---
 
@@ -69,7 +69,7 @@ cambiato nell'hardware generato.
 | 1.3 | Primo registro di configurazione | L'ordine degli argomenti C **è** la mappa registri. Nasce `gain` a 0x10, e il primo moltiplicatore | ✅ fatto |
 | 1.4 | Primo registro di stato | Un output è un puntatore perché il C lo dice. Nasce `sample_count` a 0x18 e il bit `_ap_vld` a 0x1c, nello slot che al 1.3 era `reserved` | ✅ fatto |
 | 1.5 | Controllo esplicito del pipeline | Che `PIPELINE II=1` non cambia un filo (lo faceva già il tool), cosa sono davvero II e iteration latency, e che forzare `II=2`/`4` qui non compra un DSP: `TREADY` un ciclo sì e uno no, e la sola cosa che sparisce sono i registri dei campioni in volo | ✅ fatto |
-| 1.6 | `ap_fixed` per il guadagno | Fixed point, crescita dei bit, saturazione | — |
+| 1.6 | `ap_fixed` per il guadagno, `AP_RND` + `AP_SAT` sul prodotto | Il registro trasporta bit grezzi (`gain[15:0]`), la virgola è una fetta di fili, i DSP scendono da 4 a 2 come previsto; `AP_RND` è un incrementatore sul bit 13, `AP_SAT` un confronto sui due bit alti e un mux. E `2.0` in Q2.14 non esiste | ✅ fatto |
 | 1.7 | Statistiche in variabili `static` | Registri che sopravvivono, e il reset | — |
 | 1.8 | Registri a campi di bit, flag sticky | Come si scrive un registro industriale | — |
 | 1.9 | Watchdog | Come un IP si difende da un `TLAST` mancante | — |

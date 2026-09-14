@@ -2,40 +2,42 @@
 //  axis_scaler_tb.cpp  --  Testbench auto-verificante
 // =============================================================================
 //
-//  GRADINO 1.5
+//  GRADINO 1.6
 //
-//  IL TESTBENCH NON CAMBIA. Il gradino aggiunge #pragma HLS PIPELINE II=1 al
-//  loop del DUT, e un pragma di pipeline non tocca ne' la firma della
-//  funzione ne' il valore che produce: cambia (o, qui, conferma) il RITMO con
-//  cui l'hardware accetta i campioni. E il ritmo e' esattamente la cosa che
-//  la C simulation non vede -- non ha clock. Qui hls::stream e' una coda
-//  infinita, e un loop con II=1 o II=4 produce gli stessi numeri nello
-//  stesso ordine.
+//  LA NOVITA': il DUT lavora in virgola fissa, arrotonda e satura. Il
+//  testbench deve fare tre cose nuove, e nessuna delle tre usa ap_fixed:
 //
-//  Chi lo vede, invece, e' la cosimulation: e' li' che l'II diventa cicli di
-//  clock misurati per transazione. Stesso file, stesso main(), stesso return
-//  -- ma riapplicato all'RTL nel simulatore. E' il motivo per cui il file
-//  deve restare auto-verificante (vedi sotto).
+//   1) QUANTIZZARE il guadagno. Un test dice "gain = 1.5", ma il registro a
+//      0x10 riceve 16 bit. Qualcuno deve trasformare 1.5 in 24576 (= 1.5 x
+//      2^14), e quel qualcuno e' il SOFTWARE: nel sistema vero il driver, qui
+//      il testbench. La funzione q2_14() qui sotto e' esattamente quello che
+//      il driver dovra' fare, range check compreso.
 //
-//  Dal gradino 1.4: il testbench verifica anche quello che la IP dice di se'
-//  stessa, non solo i dati che produce. Fino al 1.3 controllavamo tre cose --
-//  i valori in uscita, TLAST, e il numero di beat -- e tutte e tre
-//  viaggiavano sullo stream. Dal 1.4 la IP scrive un REGISTRO DI STATO, e
-//  quel registro e' un'uscita a tutti gli effetti: se contiene un numero
-//  sbagliato, la IP e' rotta anche se lo stream e' perfetto.
+//   2) CALCOLARE il valore atteso con arrotondamento e saturazione, per una
+//      strada che non assomigli al DUT. Il DUT usa ap_fixed e i modi AP_RND /
+//      AP_SAT; il golden model usa long long, una divisione con floor, e due
+//      confronti. Se i due arrivano allo stesso numero, e' perche' il numero
+//      e' giusto -- non perche' hanno fatto lo stesso errore.
+//
+//   3) SCEGLIERE STIMOLI che colpiscano i casi in cui le due decisioni
+//      contano: prodotti che cadono esattamente a meta' (per AP_RND) e
+//      prodotti che escono dai 32 bit (per AP_SAT). Con i valori "comodi" dei
+//      gradini precedenti arrotondamento e saturazione non scattano mai, e
+//      un test che non le fa scattare non le verifica.
+//
+//  Il caso "gain enorme: verifica il TRONCAMENTO" del gradino 1.3 sparisce:
+//  documentava un comportamento che ora non esiste piu'. Fatto girare il
+//  vecchio testbench contro questo DUT, FALLISCE -- ed e' giusto cosi'
+//  (docs/00 par. 9).
 //
 //  --------------------------------------------------------------------------
 //  UNA USCITA NON VERIFICATA E' UNA USCITA CHE NON ESISTE
 //  --------------------------------------------------------------------------
-//  Questa e' la regola che vale la pena portarsi dietro. In un testbench VHDL
-//  ti verrebbe naturale: se una entity ha una porta di uscita, la guardi. In
-//  HLS la tentazione e' di considerare "veri" solo i dati dello stream e di
-//  fidarsi del resto, perche' i registri sembrano contorno. Non lo sono.
-//
-//  Il gradino 1.9 aggiungera' un caso in cui il conteggio e' l'UNICO modo che
-//  il software ha di accorgersi che un pacchetto e' stato troncato. Se il
-//  registro non lo verifichiamo da adesso, quel bug ce lo troveremo in
-//  laboratorio.
+//  Regola dal gradino 1.4: il testbench verifica anche quello che la IP dice
+//  di se' stessa (il registro sample_count), non solo i dati che produce. In
+//  un testbench VHDL verrebbe naturale -- se una entity ha una porta di
+//  uscita, la guardi. In HLS la tentazione e' di considerare "veri" solo i
+//  dati dello stream. Non lo sono.
 //  --------------------------------------------------------------------------
 //
 //  Questo file NON viene sintetizzato. Viene compilato con clang e girato sul
@@ -48,136 +50,189 @@
 //  le INTERFACCE. Qui non esistono bus ne' indirizzi: "gain" e' un parametro
 //  di funzione e "sample_count" e' un puntatore a una variabile locale del
 //  main. Che nell'hardware vero quei due siano due indirizzi su un bus
-//  AXI4-Lite, la C simulation non lo sa e non lo verifica.
-//
-//  --------------------------------------------------------------------------
-//  PERCHE' DEVE ESSERE AUTO-VERIFICANTE (e non stampare e basta)
-//  --------------------------------------------------------------------------
-//  Nella cosimulation, Vitis HLS prende QUESTO STESSO file, lo riesegue e usa
-//  gli stessi stimoli per pilotare l'RTL vero, in un simulatore, con clock e
-//  handshake reali. Poi confronta i risultati.
-//
-//  Quel confronto si basa sul valore restituito da main():
-//
-//        return 0        ->  PASS
-//        return != 0     ->  FAIL
-//
-//  Un testbench che stampa i valori e ritorna sempre 0 fa passare la
-//  cosimulation anche quando l'hardware e' sbagliato. E' l'errore piu' costoso
-//  che si possa fare in questo flusso.
-//  --------------------------------------------------------------------------
+//  AXI4-Lite, la C simulation non lo sa e non lo verifica. Lo verifica la
+//  cosimulation, che riusa QUESTO file: l'esito della cosim e' il valore di
+//  ritorno di main() (0 = PASS), quindi un testbench che stampa e ritorna
+//  sempre 0 farebbe passare anche un hardware sbagliato.
 //
 // =============================================================================
 #include "axis_scaler.hpp"
 
+#include <climits>   // INT_MAX, INT_MIN
+#include <cmath>     // std::round
+#include <cstdint>   // int16_t
 #include <cstdio>
 #include <vector>
+
+
+// =============================================================================
+//  IL LATO SOFTWARE: quantizzare il guadagno in Q2.14
+// =============================================================================
+//
+//  Il formato e' deciso in axis_scaler.hpp (gain_t = ap_fixed<16,2>): 14 bit
+//  frazionari, quindi il valore intero da scrivere nel registro e'
+//
+//        raw = round(gain * 2^14)      con raw in [-32768, 32767]
+//
+//  cioe' gain in [-2, 2 - 2^-14]. Il range check NON e' opzionale: e' stato
+//  verificato con il compilatore che  gain_t g = 2.0;  non da' errore e
+//  avvolge a -2.0 (bit 0x8000). Un driver che non controlla il range inverte
+//  il segno del segnale senza accorgersene.
+//
+//  Ritorna false se il valore non e' rappresentabile.
+//
+static const double Q2_14_SCALA = 16384.0;   // 2^14
+
+static bool q2_14(double gain, int16_t &raw)
+{
+    double scalato = std::round(gain * Q2_14_SCALA);
+    if (scalato < -32768.0 || scalato > 32767.0) {
+        return false;
+    }
+    raw = (int16_t)scalato;
+    return true;
+}
+
+//  Costruisce il gain_t da passare al DUT a partire dai bit grezzi.
+//
+//  E' l'unico punto del testbench che tocca ap_fixed, e lo fa nel modo piu'
+//  "hardware" possibile: scrive i 16 bit cosi' come sono, come farebbe una
+//  scrittura AXI4-Lite nel registro a 0x10. Non passa per una conversione da
+//  double, di proposito: cosi' la quantizzazione resta un lavoro di q2_14(),
+//  che e' codice nostro e verificabile, e non del costruttore di ap_fixed.
+//
+static gain_t gain_da_bit(int16_t raw)
+{
+    gain_t g;
+    g.range(15, 0) = (ap_uint<16>)(uint16_t)raw;
+    return g;
+}
 
 
 // =============================================================================
 //  IL GOLDEN MODEL -- parte 1: il dato
 // =============================================================================
 //
-//  Calcola  y = x * gain  troncato a 32 bit con segno, in C puro.
+//  Calcola  y = sat32( round( x * gain ) )  in aritmetica intera pura.
 //
-//  Perche' passare da "long long" (64 bit)? Perche' il prodotto di due numeri
-//  a 32 bit puo' richiedere fino a 64 bit, e vogliamo prima calcolare il
-//  valore ESATTO, e solo dopo troncarlo deliberatamente. Cosi' il troncamento
-//  e' un passo visibile e verificabile, non un effetto collaterale nascosto.
+//  Il trucco e' lavorare sui bit grezzi del guadagno: x * raw e' esattamente
+//  x * gain * 2^14, un intero che sta in 47 bit (2^31 * 2^15), quindi in un
+//  long long senza perdere niente. Da li':
 //
-//  Il cast a "unsigned int" prima di tornare a "int" e' il modo portabile di
-//  dire "prendi i 32 bit bassi e reinterpretali con segno": la conversione
-//  diretta da long long a int fuori range, in C++, non e' definita in modo
-//  garantito, mentre il passaggio per unsigned si', perche' e' definito come
-//  modulo 2^32.
+//        AP_RND  =  floor( (p + 2^13) / 2^14 )    aggiungi mezzo LSB, poi floor
+//        AP_SAT  =  min(max(r, INT_MIN), INT_MAX)
 //
-//  E' esattamente cio' che fa l'hardware quando assegni un prodotto a un
-//  registro a 32 bit, e l'equivalente VHDL di:
-//
-//        y <= resize(x * gain, 32);
+//  L'arrotondamento "meta' verso +inf" di AP_RND (dall'header del tool: il bit
+//  scartato piu' alto viene sommato, sempre) e' proprio floor(v + 0.5):
+//  50.5 -> 51, e -50.5 -> -50, non -51. Il golden model lo riproduce con una
+//  formula diversa da quella del DUT, e i casi di prova qui sotto colpiscono
+//  esattamente le mezze unita' per controllare che i due siano d'accordo.
 //
 //  LA REGOLA DEL GOLDEN MODEL, dal gradino 1.3: non deve assomigliare al DUT.
-//  Scrivere qui la stessa riga del sorgente sintetizzato non verificherebbe
-//  niente -- se e' sbagliata, e' sbagliata identica nei due posti e il test
-//  passa comunque. Qui la strada e' un'altra: long long in C puro, senza mai
-//  passare dai tipi ap_int.
+//  Niente ap_fixed, niente AP_RND: long long, una divisione e due if.
 //
-static int golden_scala(int x, int gain)
+
+//  Divisione intera per 2^14 con FLOOR (verso -inf), che e' quello che fa
+//  l'hardware quando scarta i bit bassi di un numero in complemento a due.
+//  In C la divisione tronca verso ZERO (-3/2 = -1, non -2), quindi per i
+//  negativi con resto va corretta di uno.
+static long long floor_div_2p14(long long v)
 {
-    long long prodotto_esatto = (long long)x * (long long)gain;
-    unsigned int bassi_32     = (unsigned int)(prodotto_esatto & 0xFFFFFFFFLL);
-    return (int)bassi_32;
+    long long q = v / 16384;
+    if ((v % 16384 != 0) && (v < 0)) q--;
+    return q;
+}
+
+static int golden_scala(int x, int16_t raw_gain)
+{
+    long long prodotto = (long long)x * (long long)raw_gain;      // esatto
+    long long r        = floor_div_2p14(prodotto + (1LL << 13));  // AP_RND
+    if (r > INT_MAX) r = INT_MAX;                                 // AP_SAT
+    if (r < INT_MIN) r = INT_MIN;
+    return (int)r;
 }
 
 
 // =============================================================================
-//  IL GOLDEN MODEL -- parte 2: il conteggio
+//  IL GOLDEN MODEL -- parte 2: il conteggio (gradino 1.4, invariato)
 // =============================================================================
 //
-//  Il DUT conta i beat mentre li elabora, e si ferma quando ne vede uno con
-//  TLAST alto. Il golden model deve arrivare allo stesso numero per un'altra
-//  strada, altrimenti non verifica niente (e' la stessa regola di sopra).
-//
-//  La strada indipendente e' questa: il testbench guarda gli STIMOLI che ha
-//  costruito e conta quanti beat ci sono fino al primo TLAST incluso. Non
-//  usa n_campioni, non sa come e' fatto il loop del DUT: legge il vettore di
-//  stimoli come lo leggerebbe un osservatore esterno attaccato al bus.
-//
-//  La differenza rispetto a "tanto so gia' che sono n_campioni" e' sottile ma
-//  reale: se un giorno lo stimolo mettesse TLAST a meta' pacchetto -- per
-//  errore o di proposito -- il DUT si fermerebbe li', e il valore atteso
-//  calcolato cosi' si fermerebbe li' anche lui. Con n_campioni no: il test
-//  fallirebbe dando la colpa alla IP invece che allo stimolo.
+//  Conta i beat del vettore di stimoli fino al primo TLAST incluso, cioe'
+//  guarda il bus come lo guarderebbe un osservatore esterno. Non usa il numero
+//  di campioni chiesto dal test: se uno stimolo mettesse TLAST a meta'
+//  pacchetto, il DUT si fermerebbe li' e il modello anche.
 //
 static int golden_conteggio(const std::vector<pkt_t> &stimoli)
 {
     int n = 0;
     for (size_t i = 0; i < stimoli.size(); i++) {
-        n++;                                   // questo beat e' stato elaborato
-        if (stimoli[i].last == 1) break;       // ... ed era l'ultimo
+        n++;
+        if (stimoli[i].last == 1) break;
     }
     return n;
 }
 
 
 // -----------------------------------------------------------------------------
-//  Il valore con cui "sporchiamo" il registro di stato prima della chiamata.
-//
-//  Perche' non lasciarlo a zero? Perche' zero e' un valore plausibile, e un
-//  test che passa perche' il valore atteso coincide con quello iniziale non
-//  ha provato niente. Con un valore impossibile (negativo: un conteggio di
-//  campioni non lo e' mai) siamo sicuri che se il DUT non scrive il registro,
-//  il test se ne accorge.
-//
-//  E' la controparte software del bit _ap_vld che l'hardware genera per lo
-//  stesso identico motivo: distinguere "valore mai scritto" da "valore letto
-//  correttamente".
+//  Il valore con cui "sporchiamo" il registro di stato prima della chiamata:
+//  impossibile (negativo), cosi' se il DUT non scrive il registro il test se
+//  ne accorge. E' la controparte software del bit _ap_vld.
 // -----------------------------------------------------------------------------
 static const int SPORCO = -999999;
 
 
 // -----------------------------------------------------------------------------
-//  Un caso di prova: costruisce un pacchetto di n campioni, lo fa passare
-//  nell'IP con un certo gain, e verifica contro il golden model sia i dati
-//  in uscita sia il registro di stato.
+//  Lo stimolo di default dei gradini precedenti: valori alternati positivi e
+//  negativi, crescenti, riconoscibili a occhio nelle waveform.
+//
+//  Da questo gradino i casi di prova possono anche passare un vettore di
+//  valori scelti a mano: per arrotondamento e saturazione servono numeri
+//  precisi, non un pattern.
+// -----------------------------------------------------------------------------
+static std::vector<int> pattern(int n_campioni)
+{
+    std::vector<int> v;
+    for (int i = 0; i < n_campioni; i++) {
+        v.push_back((i % 2 == 0) ? (100 + i) : -(100 + i));
+    }
+    return v;
+}
+
+
+// -----------------------------------------------------------------------------
+//  Un caso di prova: fa passare i campioni "valori" nell'IP con un certo gain
+//  (reale, quantizzato qui in Q2.14) e verifica dati, protocollo e registro
+//  di stato contro il golden model.
 //
 //  Ritorna il numero di errori trovati (0 = tutto bene).
 // -----------------------------------------------------------------------------
-static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
+static int prova_pacchetto(const std::vector<int> &valori, double gain,
+                           const char *descrizione)
 {
-    printf("\n--- %d campioni, gain = %d  (%s) ---\n",
-           n_campioni, gain, descrizione);
+    const int n_campioni = (int)valori.size();
 
-    // I due canali. Sono gli stessi oggetti che la top function ricevera'.
-    hls::stream<pkt_t> s_axis("s_axis");   // il nome serve nei messaggi d'errore
+    // -------------------------------------------------------------------------
+    //  0) QUANTIZZAZIONE del guadagno: il lavoro del driver.
+    //
+    //  Un gain fuori range e' un errore del TEST, non del DUT, e lo trattiamo
+    //  come tale: il caso conta come fallito e lo dice chiaramente.
+    // -------------------------------------------------------------------------
+    int16_t raw = 0;
+    if (!q2_14(gain, raw)) {
+        printf("\n--- gain = %g  (%s) ---\n", gain, descrizione);
+        printf("  ERRORE DI TEST: gain %g non rappresentabile in Q2.14 "
+               "[-2, 1.99993896]\n", gain);
+        return 1;
+    }
+
+    printf("\n--- %d campioni, gain = %g  (Q2.14: %d = 0x%04x)  (%s) ---\n",
+           n_campioni, gain, (int)raw, (unsigned)(uint16_t)raw, descrizione);
+
+    hls::stream<pkt_t> s_axis("s_axis");
     hls::stream<pkt_t> m_axis("m_axis");
 
-    // Qui teniamo da parte quello che ci aspettiamo di rileggere, calcolato
-    // dal golden model.
-    std::vector<int> atteso;
-
-    // E qui gli stimoli, per poterli rileggere dal golden model del conteggio.
-    std::vector<pkt_t> stimoli;
+    std::vector<int>   atteso;    // dal golden model
+    std::vector<pkt_t> stimoli;   // per il golden model del conteggio
 
     // -------------------------------------------------------------------------
     //  1) STIMOLO: riempiamo lo stream d'ingresso
@@ -185,59 +240,35 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
     for (int i = 0; i < n_campioni; i++) {
 
         pkt_t campione;
+        campione.data = valori[i];
 
-        // Un pattern riconoscibile a occhio quando guardi le waveform:
-        // valori alternati positivi e negativi, crescenti.
-        int valore = (i % 2 == 0) ? (100 + i) : -(100 + i);
-        campione.data = valore;
-
-        // TKEEP e TSTRB: tutti i byte validi.
-        //
-        //  Perche' devo scriverli a mano? Perche' sono segnali del protocollo
-        //  e il tool non inventa il loro valore. In una IP che elabora dati
-        //  "densi" (ogni beat e' un campione intero) valgono sempre tutti 1.
-        //
-        //  -1 su un ap_uint<4> vale 0b1111. E' un idioma comodo: mette a 1
-        //  tutti i bit qualunque sia la larghezza, come (others => '1') in VHDL.
+        // TKEEP e TSTRB: tutti i byte validi. -1 su un ap_uint<4> vale 0b1111,
+        // come (others => '1') in VHDL.
         campione.keep = -1;
         campione.strb = -1;
 
-        // TLAST alto solo sull'ultimo campione: e' cosi' che si delimita un
-        // pacchetto in AXI4-Stream.
+        // TLAST alto solo sull'ultimo campione.
         campione.last = (i == n_campioni - 1) ? 1 : 0;
 
         s_axis.write(campione);
         stimoli.push_back(campione);
 
-        // Il valore atteso lo calcola il GOLDEN MODEL, non il DUT.
-        atteso.push_back(golden_scala(valore, gain));
+        // Il valore atteso lo calcola il GOLDEN MODEL, sui bit grezzi.
+        atteso.push_back(golden_scala(valori[i], raw));
     }
 
     // -------------------------------------------------------------------------
-    //  2) ESECUZIONE: chiamiamo la top function
-    // -------------------------------------------------------------------------
+    //  2) ESECUZIONE: una chiamata = una transazione dell'IP = un pacchetto.
     //
-    //  Una chiamata = una transazione dell'IP = un pacchetto.
-    //
-    //  Nota come i due argomenti scalari raccontino due direzioni diverse:
-    //
-    //        gain           passato per valore    -> lo diamo noi alla IP
-    //        &sample_count  passato per indirizzo -> lo compila la IP per noi
-    //
-    //  In hardware questa chiamata corrisponde a:
-    //
-    //        scrivi gain nel suo registro AXI4-Lite   (offset 0x10)
-    //        scrivi CTRL bit0 = 1                     (ap_start)
+    //  In hardware:
+    //        scrivi raw nel registro gain          (offset 0x10, 16 bit)
+    //        scrivi CTRL bit0 = 1                  (ap_start)
     //        aspetta ap_done
-    //        leggi il registro sample_count           (offset 0x18)
-    //
-    //  L'ordine di quelle quattro righe non e' negoziabile, ed e' il motivo
-    //  per cui sporchiamo la variabile prima: vogliamo che il test fallisca se
-    //  la IP non scrive davvero il registro.
-    //
+    //        leggi il registro sample_count        (offset 0x18)
+    // -------------------------------------------------------------------------
     int sample_count = SPORCO;
 
-    axis_scaler(s_axis, m_axis, gain, &sample_count);
+    axis_scaler(s_axis, m_axis, gain_da_bit(raw), &sample_count);
 
     // -------------------------------------------------------------------------
     //  3) VERIFICA
@@ -245,9 +276,6 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
     int errori = 0;
 
     // Controllo 1: e' uscito il numero giusto di campioni?
-    //
-    //  Una IP che perde o duplica campioni e' rotta anche se i dati che escono
-    //  sono giusti. Va controllato per primo.
     if ((int)m_axis.size() != n_campioni) {
         printf("  ERRORE: attesi %d campioni in uscita, ne sono usciti %d\n",
                n_campioni, (int)m_axis.size());
@@ -259,20 +287,17 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
 
         pkt_t uscita = m_axis.read();
 
-        // 2a) il dato, confrontato col golden model
+        // 2a) il dato, confrontato col golden model. Il messaggio stampa
+        //     anche l'ingresso: per arrotondamento e saturazione e' quello
+        //     che serve per capire al volo cosa e' andato storto.
         int ottenuto = (int)uscita.data;
         if (ottenuto != atteso[i]) {
-            printf("  ERRORE campione %d: atteso %d, ottenuto %d\n",
-                   i, atteso[i], ottenuto);
+            printf("  ERRORE campione %d: x = %d, atteso %d, ottenuto %d\n",
+                   i, valori[i], atteso[i], ottenuto);
             errori++;
         }
 
-        // 2b) TLAST -- si verifica come e piu' del dato.
-        //
-        //  Un TLAST mancante o nel posto sbagliato non si vede guardando i
-        //  numeri, ma manda in stallo il DMA a valle. E' esattamente il tipo
-        //  di bug che costa una giornata in laboratorio, quindi lo si prende
-        //  qui, in un secondo di simulazione C.
+        // 2b) TLAST: un TLAST mancante manda in stallo il DMA a valle.
         ap_uint<1> last_atteso = (i == n_campioni - 1) ? 1 : 0;
         if (uscita.last != last_atteso) {
             printf("  ERRORE campione %d: TLAST atteso %d, ottenuto %d\n",
@@ -280,16 +305,7 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
             errori++;
         }
 
-        // 2c) TKEEP e TSTRB devono essere propagati intatti.
-        //
-        //  Ora che l'IP modifica il dato, vale la pena controllare anche che
-        //  NON abbia modificato i segnali di contorno: un bug che azzera
-        //  TKEEP produce uno stream formalmente valido ma che il DMA a valle
-        //  interpreta come "nessun byte utile".
-        //
-        //  C_DATA_WIDTH/8 = 4, cioe' la larghezza di TKEEP e TSTRB: la
-        //  ricaviamo dalla costante invece di scrivere 4, cosi' il controllo
-        //  resta valido se un giorno cambieremo la larghezza del dato.
+        // 2c) TKEEP e TSTRB propagati intatti.
         const ap_uint<C_DATA_WIDTH/8> tutti_uni = -1;
         if (uscita.keep != tutti_uni || uscita.strb != tutti_uni) {
             printf("  ERRORE campione %d: TKEEP/TSTRB alterati (keep=%d strb=%d)\n",
@@ -299,28 +315,13 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
     }
 
     // Controllo 3: lo stream d'ingresso e' stato consumato tutto?
-    //
-    //  Se avanzano campioni significa che l'IP si e' fermata prima del tempo.
     if (!s_axis.empty()) {
         printf("  ERRORE: sono rimasti %d campioni non letti in ingresso\n",
                (int)s_axis.size());
         errori++;
     }
 
-    // -------------------------------------------------------------------------
-    //  Controllo 4: IL REGISTRO DI STATO (la novita' del gradino 1.4)
-    // -------------------------------------------------------------------------
-    //
-    //  Due errori distinti, e vale la pena distinguerli anche nei messaggi,
-    //  perche' indicano guasti diversi:
-    //
-    //    - il registro e' rimasto SPORCO -> la IP non ha mai scritto l'uscita.
-    //      In hardware sarebbe il caso in cui _ap_vld non si alza mai: il bus
-    //      risponde, ma con un valore che non significa niente;
-    //
-    //    - il registro contiene un numero diverso da quello atteso -> la IP
-    //      ha contato, ma ha contato male.
-    //
+    // Controllo 4: il registro di stato (gradino 1.4).
     int conteggio_atteso = golden_conteggio(stimoli);
 
     if (sample_count == SPORCO) {
@@ -343,86 +344,134 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
 
 
 // -----------------------------------------------------------------------------
+//  Auto-test del quantizzatore.
+//
+//  Non verifica il DUT: verifica che il LATO SOFTWARE sappia cosa sta
+//  scrivendo nel registro. E' il tipo di controllo che in un driver vero
+//  finisce in uno unit test, e qui serve a fissare tre fatti del formato:
+//  gli estremi, la risoluzione, e che 2.0 NON esiste.
+// -----------------------------------------------------------------------------
+static int prova_quantizzatore()
+{
+    printf("\n--- il quantizzatore Q2.14 (lato software) ---\n");
+    int errori = 0;
+    int16_t raw = 0;
+
+    struct caso_t { double gain; bool ok; int16_t atteso; const char *nota; };
+    const caso_t casi[] = {
+        {  1.0,           true,   16384, "uno"                          },
+        {  0.5,           true,    8192, "un mezzo"                     },
+        { -2.0,           true,  -32768, "il minimo del formato"        },
+        {  1.99993896,    true,   32767, "il massimo: 2 - 2^-14"        },
+        {  0.00006103515, true,       1, "la risoluzione: 2^-14"        },
+        {  2.0,           false,      0, "NON rappresentabile: rifiutato"},
+        { -2.00006,       false,      0, "sotto il minimo: rifiutato"   },
+    };
+
+    for (size_t i = 0; i < sizeof(casi)/sizeof(casi[0]); i++) {
+        bool ok = q2_14(casi[i].gain, raw);
+        bool giusto = (ok == casi[i].ok) && (!ok || raw == casi[i].atteso);
+        if (ok) printf("  %-14g -> raw %6d  (%s)\n", casi[i].gain, (int)raw, casi[i].nota);
+        else    printf("  %-14g -> rifiutato   (%s)\n", casi[i].gain, casi[i].nota);
+        if (!giusto) {
+            printf("  ERRORE: atteso %s %d\n",
+                   casi[i].ok ? "raw" : "rifiuto", (int)casi[i].atteso);
+            errori++;
+        }
+    }
+    return errori;
+}
+
+
+// -----------------------------------------------------------------------------
 //  main() -- il punto d'ingresso del testbench
 // -----------------------------------------------------------------------------
 int main()
 {
     printf("=====================================================\n");
-    printf(" axis_scaler -- testbench gradino 1.5 (pipeline esplicito)\n");
+    printf(" axis_scaler -- testbench gradino 1.6 (virgola fissa)\n");
     printf("=====================================================\n");
 
     int errori = 0;
 
-    // -------------------------------------------------------------------------
-    //  I casi di prova.
-    //
-    //  Tre dimensioni da coprire, ortogonali fra loro:
-    //    - la LUNGHEZZA del pacchetto (casi limite del protocollo, e ora anche
-    //      il valore che ci aspettiamo nel registro di stato)
-    //    - il VALORE del gain         (casi limite dell'aritmetica)
-    //    - la SEQUENZA delle chiamate (il registro riporta l'ultimo pacchetto?)
-    // -------------------------------------------------------------------------
-
-    // --- Casi limite del protocollo, a gain fisso ---
-    errori += prova_pacchetto(1,  2, "pacchetto minimo: TLAST sul primo beat");
-    errori += prova_pacchetto(8,  2, "lunghezza normale");
-    errori += prova_pacchetto(17, 2, "lunghezza dispari, non potenza di due");
-
-    // --- Casi limite dell'aritmetica, a lunghezza fissa ---
-    //
-    //  gain = 1 e' il caso "identita'": verifica che l'IP con gain unitario
-    //  si comporti come il pass-through del gradino 1.2. E' un buon controllo
-    //  di non-regressione fra un gradino e l'altro.
-    errori += prova_pacchetto(8,  1, "identita': deve comportarsi come il 1.2");
-
-    //  gain = 0 azzera tutto. Caso degenere ma legittimo, e utile: verifica
-    //  che il registro venga davvero letto e non ignorato.
-    //
-    //  Da questo gradino ha un secondo scopo: i dati in uscita sono tutti zero,
-    //  ma sample_count deve valere 8. Se il conteggio dipendesse per sbaglio
-    //  dai dati invece che dai beat, qui si vedrebbe.
-    errori += prova_pacchetto(8,  0, "gain nullo: uscita a zero, conteggio no");
-
-    //  gain negativo: verifica che l'aritmetica con segno funzioni. Con
-    //  ap_int (e non ap_uint) il segno c'e', ma va provato.
-    errori += prova_pacchetto(8, -3, "gain negativo: aritmetica con segno");
+    errori += prova_quantizzatore();
 
     // -------------------------------------------------------------------------
-    //  Il caso aritmetico che ci interessa di piu': IL TRONCAMENTO.
-    //
-    //  Un gain grande manda il prodotto fuori dai 32 bit. Non ci aspettiamo
-    //  un valore "giusto" in senso matematico: ci aspettiamo esattamente i 32
-    //  bit bassi del prodotto, che e' quello che l'hardware produce.
-    //
-    //  Questo test e' importante per una ragione di metodo: documenta il
-    //  comportamento reale invece di evitarlo. Se un giorno aggiungeremo la
-    //  saturazione (gradino 1.8), questo test dovra' essere aggiornato -- e il
-    //  fatto che FALLISCA sara' la prova che la saturazione funziona.
+    //  Casi limite del protocollo, a gain unitario (non regressione dal 1.5:
+    //  con gain = 1.0 il prodotto e' esatto e l'IP deve comportarsi come un
+    //  pass-through).
     // -------------------------------------------------------------------------
-    errori += prova_pacchetto(4, 100000000,
-                              "gain enorme: verifica il TRONCAMENTO a 32 bit");
+    printf("\n=== protocollo, gain = 1.0 ===\n");
+    errori += prova_pacchetto(pattern(1),  1.0, "pacchetto minimo: TLAST sul primo beat");
+    errori += prova_pacchetto(pattern(8),  1.0, "identita': deve comportarsi come il pass-through");
+    errori += prova_pacchetto(pattern(17), 1.0, "lunghezza dispari, non potenza di due");
 
     // -------------------------------------------------------------------------
-    //  Il caso nuovo del gradino 1.4: DUE PACCHETTI DI LUNGHEZZA DIVERSA,
-    //  uno dopo l'altro.
+    //  Casi dell'aritmetica che gia' conoscevamo, ora in virgola fissa.
+    // -------------------------------------------------------------------------
+    printf("\n=== aritmetica: i casi dei gradini precedenti ===\n");
+    errori += prova_pacchetto(pattern(8),  0.0, "gain nullo: uscita a zero, conteggio no");
+    errori += prova_pacchetto(pattern(8), -1.0, "gain negativo: aritmetica con segno");
+    errori += prova_pacchetto(pattern(8),  1.5, "gain frazionario: la ragione di ap_fixed");
+
+    // -------------------------------------------------------------------------
+    //  IL CASO NUOVO 1: L'ARROTONDAMENTO (AP_RND).
     //
-    //  Serve a verificare una proprieta' precisa: il contatore e' una variabile
-    //  LOCALE, quindi deve ripartire da zero a ogni chiamata. Il registro deve
-    //  riportare la lunghezza dell'ULTIMO pacchetto, non la somma.
+    //  Con gain = 0.5, un x dispari da' un prodotto che cade ESATTAMENTE a
+    //  meta' fra due interi: 101 * 0.5 = 50.5. Qui la politica conta:
     //
-    //  Se qualcuno un giorno trasformasse "conteggio" in una variabile static
-    //  -- che e' proprio quello che faremo al gradino 1.7, ma per le
-    //  statistiche cumulative, non per questo registro -- questi due casi
-    //  darebbero 3 e 5+3=8 invece di 3 e 5, e il test lo direbbe subito.
+    //        AP_TRN (il default)     50.5 -> 50     -50.5 -> -51   (floor)
+    //        AP_RND (il nostro)      50.5 -> 51     -50.5 -> -50   (+0.5, floor)
     //
-    //  Nota di metodo: ogni chiamata a prova_pacchetto e' gia' una transazione
-    //  separata, quindi in un certo senso lo stavamo gia' verificando. Renderlo
-    //  esplicito con due lunghezze vicine e diverse lo rende leggibile a chi
-    //  legge l'output: 3 poi 5, non c'e' modo di confonderle.
+    //  Nota l'asimmetria di AP_RND sui negativi: -50.5 va a -50, cioe' verso
+    //  +inf, non "via dallo zero". E' la definizione del modo (dall'header
+    //  del tool: "rounding to plus infinity"), e il golden model la riproduce
+    //  con floor(v + 0.5). Se un giorno servisse un arrotondamento senza
+    //  bias, il modo e' AP_RND_CONV (pari piu' vicino).
+    //
+    //  Con gain = 0.25 si coprono anche i quarti: 25.25 -> 25, 25.75 -> 26.
+    // -------------------------------------------------------------------------
+    printf("\n=== AP_RND: prodotti a meta' fra due interi ===\n");
+    errori += prova_pacchetto({101, -101, 103, -103, 1, -1, 3, -3}, 0.5,
+                              "x dispari * 0.5: la meta' esatta va verso +inf");
+    errori += prova_pacchetto({101, 102, 103, -101, -102, -103}, 0.25,
+                              "quarti: 0.25 -> giu', 0.5 -> su, 0.75 -> su");
+
+    // -------------------------------------------------------------------------
+    //  IL CASO NUOVO 2: LA SATURAZIONE (AP_SAT).
+    //
+    //  Con |gain| < 2 il prodotto esce dai 32 bit solo se |x| e' vicino a
+    //  2^31: servono ingressi scelti apposta.
+    //
+    //        INT_MAX * 1.5    = +3.2e9   -> non ci sta  -> INT_MAX
+    //        INT_MIN * 1.5    = -3.2e9   -> non ci sta  -> INT_MIN
+    //        2^30    * 1.5    = 1.61e9   -> ci sta      -> esatto
+    //
+    //  E il caso che da solo giustifica AP_SAT, perche' con il troncamento
+    //  del 1.3 dava il SEGNO SBAGLIATO:
+    //
+    //        INT_MIN * -1.0   = +2^31    -> con AP_WRAP: -2^31 (INT_MIN!)
+    //                                    -> con AP_SAT:  +2^31 - 1
+    // -------------------------------------------------------------------------
+    printf("\n=== AP_SAT: prodotti fuori dai 32 bit ===\n");
+    errori += prova_pacchetto({INT_MAX, INT_MIN, 1 << 30, -(1 << 30), 0}, 1.5,
+                              "ai bordi: satura sopra e sotto, esatto in mezzo");
+    errori += prova_pacchetto({INT_MIN, INT_MAX, -1, 1}, -1.0,
+                              "-(-2^31): con il wrap era INT_MIN, ora INT_MAX");
+
+    // -------------------------------------------------------------------------
+    //  Gli estremi del formato del guadagno.
+    // -------------------------------------------------------------------------
+    printf("\n=== gli estremi di Q2.14 ===\n");
+    errori += prova_pacchetto(pattern(8), -2.0,       "il minimo: -2.0");
+    errori += prova_pacchetto(pattern(8),  1.99993896, "il massimo: 2 - 2^-14 (2.0 non esiste)");
+
+    // -------------------------------------------------------------------------
+    //  Due transazioni consecutive (gradino 1.4): il conteggio non si accumula.
     // -------------------------------------------------------------------------
     printf("\n=== due transazioni consecutive: il conteggio non si accumula ===\n");
-    errori += prova_pacchetto(3, 2, "prima transazione: sample_count deve dare 3");
-    errori += prova_pacchetto(5, 2, "seconda transazione: deve dare 5, non 8");
+    errori += prova_pacchetto(pattern(3), 1.0, "prima transazione: sample_count deve dare 3");
+    errori += prova_pacchetto(pattern(5), 1.0, "seconda transazione: deve dare 5, non 8");
 
     printf("\n=====================================================\n");
     if (errori == 0) {
@@ -432,7 +481,6 @@ int main()
     }
     printf("=====================================================\n");
 
-    // Il valore di ritorno E' il risultato del test. Vedi la nota in testa
-    // al file: da questo dipende anche l'esito della cosimulation.
+    // Il valore di ritorno E' il risultato del test (anche per la cosim).
     return errori;
 }

@@ -2,23 +2,24 @@
 //  axis_scaler.cpp  --  Implementazione della top function
 // =============================================================================
 //
-//  GRADINO 1.5  --  IL CONTROLLO ESPLICITO DEL PIPELINE
+//  GRADINO 1.6  --  VIRGOLA FISSA, ARROTONDAMENTO E SATURAZIONE
 //
-//  Fino al gradino 1.4 ogni riga aggiunta faceva comparire qualcosa nell'RTL:
-//  porte, registri, un moltiplicatore, un bit di validita'. Questo gradino e'
-//  diverso, e lo e' di proposito: aggiungiamo UNA riga
+//  Fino al 1.5 il calcolo era  y = x * gain  con gain intero, e il prodotto
+//  veniva TRONCATO ai 32 bit bassi: per un guadagno grande il risultato
+//  avvolgeva, e il testbench lo documentava come "comportamento reale".
 //
-//        #pragma HLS PIPELINE II=1
+//  Ora il guadagno e' un numero in virgola fissa Q2.14 (vedi axis_scaler.hpp)
+//  e il prodotto viene:
 //
-//  e l'RTL generato NON CAMBIA. Non e' un esperimento fallito: e' la conferma
-//  di una cosa scoperta al gradino 1.1, cioe' che il tool mette in pipeline i
-//  loop da solo. Il pragma dichiara per iscritto il ritmo che vogliamo -- un
-//  campione per colpo di clock -- invece di lasciarlo a un default.
+//        calcolato ESATTO su 48 bit             (prod_t)
+//        ARROTONDATO al piu' vicino             (AP_RND)
+//        SATURATO se non sta in 32 bit          (AP_SAT)
 //
-//  Obiettivo del gradino: capire cosa sono davvero "II" e "iteration latency"
-//  guardando cosa succede all'hardware quando l'II lo FORZIAMO a 2 e a 4, e
-//  quando il pipeline lo spegniamo. Quegli esperimenti stanno in scratchpad,
-//  i risultati in docs/00 par. 8. Qui in src/ resta solo la riga permanente.
+//  Tre righe di C al posto di una. Quello che c'e' da capire in questo
+//  gradino sta tutto in DOVE i bit si perdono, e in quanto hardware costano
+//  le due decisioni: la previsione, scritta prima di sintetizzare, e' che il
+//  moltiplicatore scenda da 4 a 2 DSP (un operando e' passato da 32 a 16 bit)
+//  e che AP_RND e AP_SAT compaiano come un sommatore e un mux in piu'.
 //
 // =============================================================================
 #include "axis_scaler.hpp"
@@ -26,7 +27,7 @@
 
 void axis_scaler(hls::stream<pkt_t> &s_axis,
                  hls::stream<pkt_t> &m_axis,
-                 int                 gain,
+                 gain_t              gain,
                  int                *sample_count)
 {
     // =========================================================================
@@ -85,7 +86,12 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
     //  transazione: in C un parametro non cambia mentre la funzione gira, e in
     //  hardware vale la stessa cosa.
     //
-    //  INVARIATO dal gradino 1.3.
+    //  Il pragma e' INVARIATO dal gradino 1.3. Quello che cambia al 1.6 e' il
+    //  tipo dell'argomento, e con lui la larghezza del registro: 16 bit utili
+    //  su una parola da 32. Il software ci scrive i bit grezzi del Q2.14 --
+    //  per gain = 0.5 scrive 8192, per gain = 1.5 scrive 24576 -- e nessuna
+    //  logica in hardware "interpreta" la virgola: e' solo un modo di leggere
+    //  quei 16 bit quando entrano nel moltiplicatore.
     //
 #pragma HLS INTERFACE mode=s_axilite port=gain bundle=ctrl
 
@@ -218,8 +224,15 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
         //  scrive invece in hls_config.cfg la forma equivalente
         //        syn.directive.pipeline=axis_scaler/copia_pacchetto II=1
         //  che e' quella usata per lo sweep in scratchpad.
+        //
+        //  NOTA (gradino 1.6): la riga qui sotto e' COMMENTATA di proposito,
+        //  per scelta di chi sta studiando. Con il default pipeline_loops=64
+        //  il tool la deduce da solo (ricompare syn/inferred_directives.ini,
+        //  il log dice "Target II = NA, Final II = 1") e l'RTL e' identico.
+        //  Quello che si perde e' solo la blindatura contro un cfg diverso,
+        //  descritta sopra. Per riattivarla basta togliere le due barre.
         // ---------------------------------------------------------------------
-#pragma HLS PIPELINE II=1
+//#pragma HLS PIPELINE II=1
 
         // --- LETTURA BLOCCANTE ------------------------------------------------
         //
@@ -240,17 +253,57 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
         //
         ultimo = (campione.last == 1);
 
-        // --- IL CALCOLO (gradino 1.3) -----------------------------------------
+        // =====================================================================
+        //  IL CALCOLO  --  LA MODIFICA DEL GRADINO 1.6
+        // =====================================================================
         //
-        //  Il prodotto viene TRONCATO a 32 bit: campione.data e' ap_int<32> e
-        //  il risultato esatto ne vorrebbe 64. Teniamo i 32 bit bassi, come
-        //  farebbe  y <= resize(x * gain, 32);  in VHDL. La saturazione
-        //  arrivera' al gradino 1.8.
+        //  Al 1.3 era una riga:   campione.data = campione.data * gain;
+        //  con gain intero e il prodotto troncato ai 32 bit bassi. Ora sono
+        //  tre, e ognuna risponde a una domanda diversa.
         //
-        //  Costa 4 DSP e allunga la iteration latency a 4 cicli, ma l'II resta
-        //  1: entra un campione ogni colpo di clock.
+        //  1) IL PRODOTTO ESATTO. Un ap_int<32> per un ap_fixed<16,2> da' un
+        //     ap_fixed<48,34>: 48 bit, nessuna perdita, per qualunque coppia
+        //     di operandi. E' la "crescita dei bit" di fixed_pkg:
         //
-        campione.data = campione.data * gain;
+        //           sfixed(31 downto 0) * sfixed(1 downto -14) = sfixed(33 downto -14)
+        //
+        //     In hardware e' il moltiplicatore. Previsione: 2 DSP invece di 4,
+        //     perche' un operando e' sceso da 32 a 16 bit e il DSP58 di
+        //     Versal e' un 27x24 -- 32 bit richiedono due tagli, 16 uno solo.
+        //
+        prod_t prodotto = campione.data * gain;
+
+        //  2) LA DECISIONE. Assegnare un Q34.14 a un tipo da 32 bit interi
+        //     butta via 14 bit frazionari e 2 bit interi. COME buttarli via
+        //     lo dicono i modi del tipo di DESTINAZIONE, out_t:
+        //
+        //           AP_RND   14 bit frazionari  ->  arrotonda al piu' vicino
+        //                    (la meta' esatta va verso +inf: 50.5 -> 51,
+        //                     -50.5 -> -50; verificato con il compilatore)
+        //           AP_SAT    2 bit interi      ->  satura a 0x7FFFFFFF /
+        //                    0x80000000 invece di avvolgere
+        //
+        //     In VHDL:  resize(prodotto, 31, 0, fixed_saturate, fixed_round)
+        //
+        //     Questa riga NON e' gratis, ed e' il punto del gradino: e' un
+        //     sommatore (aggiunge mezzo LSB, cioe' 2^13, prima di scartare i
+        //     bit bassi) piu' un confronto sui bit alti e un mux a 32 bit che
+        //     sceglie fra valore, massimo e minimo. Da cercare nel report,
+        //     nelle voci Expression e Multiplexer.
+        //
+        //     Il caso che giustifica AP_SAT da solo: x = -2^31 e gain = -1.0.
+        //     Il prodotto esatto e' +2^31, che in 32 bit con segno non esiste.
+        //     Con AP_WRAP diventa -2^31: il segno sbagliato, in silenzio. Con
+        //     AP_SAT diventa +2^31-1: sbagliato di uno, e nel verso giusto.
+        //
+        out_t y = prodotto;
+
+        //  3) LA COPIA. out_t e ap_int<32> hanno gli stessi 32 bit con lo
+        //     stesso significato (nessuna parte frazionaria): questa
+        //     assegnazione non converte niente, e' un filo. I modi Q e O di
+        //     out_t hanno gia' agito nella riga precedente.
+        //
+        campione.data = y;
 
         // --- SCRITTURA BLOCCANTE ---------------------------------------------
         //
@@ -315,24 +368,28 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
 //  COSA GUARDARE DOPO AVER SINTETIZZATO QUESTO FILE
 // =============================================================================
 //
-//  Stavolta la lista e' di cose che NON devono cambiare, piu' una.
+//  Le previsioni, scritte PRIMA di sintetizzare (il confronto e' in docs/00
+//  par. 9):
 //
-//  1) diff del VHDL contro il build 1.4 congelato: zero righe. Se compare
-//     una differenza, il pragma ha fatto qualcosa che non avevamo previsto.
+//  1) xaxis_scaler_hw.h: a 0x10 "bit 15~0 - gain[15:0]" invece di 31~0, e
+//     XAXIS_SCALER_CTRL_BITS_GAIN_DATA = 16. Gli offset NON si muovono.
 //
-//  2) Il report: stessi 4 DSP / 298 FF / 343 LUT, stesso Estimated 2,238 ns,
-//     e nella tabella dei loop  II achieved = 1, target = 1, Pipelined = yes.
-//     La colonna "target" c'era gia' al 1.4 con lo stesso valore: il default
-//     e il pragma chiedono la stessa cosa.
+//  2) La entity top: identica. Nella entity del banco registri, gain passa
+//     da STD_LOGIC_VECTOR(31 downto 0) a (15 downto 0).
 //
-//  3) syn/inferred_directives.ini: al 1.4 elencava il pipeline come dedotto
-//     ("Inferred from syn.compile.pipeline_loops=64"). Ora che lo dichiariamo
-//     noi, quella riga deve sparire. E' l'unica traccia della modifica.
+//  3) Il report: DSP da 4 a 2. Il modulo del moltiplicatore cambia nome
+//     (era mul_32s_32s_32_2_1: 32 x 32 -> 32 bit; ora l'uscita deve avere i
+//     bit alti per la saturazione, quindi piu' larga). FF e LUT: piu' LUT
+//     per AP_RND e AP_SAT, meno FF perche' i registri di pipeline del
+//     prodotto sono piu' stretti. La iteration latency puo' crescere di uno
+//     o due cicli (sommatore e mux dopo il moltiplicatore); l'II resta 1.
 //
-//  4) La cosim (C/RTL COSIMULATION > Run): la tabella delle transazioni in
-//     sim/report/verilog/result.transaction.rpt deve coincidere al ciclo con
-//     quella del 1.4. E' la conferma fatta dove conta, sull'RTL in esecuzione.
+//  4) Nel VHDL: cercare la costante 2^13 (16#2000#) del mezzo LSB, e il mux
+//     della saturazione con 0x7FFFFFFF e 0x80000000.
 //
-//  Nel GRADINO 1.6 gain diventa ap_fixed<16,2>: la previsione, da docs/05
-//  par. 6, e' che i DSP scendano da 4 a 1. Da scrivere PRIMA di sintetizzare.
+//  5) Il vecchio testbench (gradino 1.5) fatto girare contro questo sorgente
+//     deve FALLIRE: passava gain interi (2, -3, 100000000) che ora vengono
+//     convertiti in Q2.14 avvolgendo, e il caso "gain enorme" documentava il
+//     troncamento che abbiamo appena eliminato. Un test vecchio che fallisce
+//     su un comportamento nuovo e' la prova che stava verificando qualcosa.
 // =============================================================================

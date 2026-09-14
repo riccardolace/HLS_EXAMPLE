@@ -1693,3 +1693,251 @@ infinita, e un loop a II=1 o a II=4 produce gli stessi numeri nello stesso
 ordine. Infatti `make csim` è passato identico sulle sette varianti; è la
 **cosim** che ha distinto 1 da 2, 3 e 4 cicli per campione. Il file è lo
 stesso: stesso `main()`, stesso `return`, riapplicato all'RTL nel simulatore.
+
+---
+
+## 9. Cosa abbiamo osservato al gradino 1.6
+
+Modifica: **un tipo, e una riga che diventa tre**.
+
+```diff
++ typedef ap_fixed<16, 2>                  gain_t;   // Q2.14
++ typedef ap_fixed<48, 34>                 prod_t;   // il prodotto esatto
++ typedef ap_fixed<32, 32, AP_RND, AP_SAT> out_t;    // 32 bit interi: arrotonda e satura
+
+  void axis_scaler(hls::stream<pkt_t> &s_axis,
+                   hls::stream<pkt_t> &m_axis,
+-                  int                 gain,
++                  gain_t              gain,
+                   int                *sample_count);
+
+-     campione.data = campione.data * gain;
++     prod_t prodotto = campione.data * gain;   // 48 bit, nessuna perdita
++     out_t  y        = prodotto;               // qui: AP_RND sui 14 bit bassi, AP_SAT sui 2 alti
++     campione.data   = y;                      // stessi 32 bit: un filo
+```
+
+È il primo gradino con una **previsione quantitativa** scritta nel sorgente
+prima di sintetizzare, e vale la pena partire dal confronto.
+
+### Previsioni contro misure
+
+| Previsione (nel `.cpp`, prima della sintesi) | Misura |
+|---|---|
+| `_hw.h`: `bit 15~0 - gain[15:0]`, `BITS_GAIN_DATA = 16`, offset fermi | ✓ esatto |
+| entity top identica; nel banco registri `gain` da 31 a 15 downto 0 | ✓ esatto |
+| DSP da 4 a **2** (DSP58 = 27×24: un operando a 32 bit richiede due tagli, 16 bit uno) | ✓ `mul_32s_16s_48_1_1`: 2 DSP, 0 FF, 0 LUT |
+| moltiplicatore con uscita più larga (servono i bit alti per saturare) | ✓ da `_32_` a `_48_`: uscita a 48 bit |
+| AP_RND = un sommatore, AP_SAT = un confronto e un mux | ✓ esattamente (vedi sotto) |
+| iteration latency +1 o +2 | ✗ **resta 4**, II resta 1 |
+| meno FF, perché il prodotto è più stretto | ✗ **+38 FF** nella stima — ma vedi la nota sui FF |
+
+| | DSP | FF | LUT | II | Iter. lat. | Estimated |
+|---|---|---|---|---|---|---|
+| 1.5 | 4 | 298 | 343 | 1 | 4 | 2,238 ns |
+| 1.6 | **2** | 336 | 394 | 1 | 4 | **2,726 ns** |
+
+Il timing peggiora di mezzo nanosecondo (siamo comunque a 4 ns di budget). Il
+moltiplicatore del 1.5 era `mul_32s_32s_32_2_1`, con un registro interno
+(`buff0`) che lo spezzava in due stadi; il nuovo `mul_32s_16s_48_1_1` è
+**combinatorio** (`NUM_STAGE => 1`), e dopo di lui nello stesso ciclo non c'è
+niente: il tool registra il prodotto e fa arrotondamento e saturazione nel
+ciclo dopo. Il percorso critico non è nel report di sintesi, e non inventiamo
+una spiegazione; con il *Schedule Viewer* della GUI si vede quale operazione
+sta dove nei quattro stadi.
+
+### Il registro trasporta bit grezzi
+
+`xaxis_scaler_hw.h`, diff rispetto al 1.5:
+
+```diff
+  // 0x10 : Data signal of gain
+- //        bit 31~0 - gain[31:0] (Read/Write)
++ //        bit 15~0 - gain[15:0] (Read/Write)
++ //        others   - reserved
+- #define XAXIS_SCALER_CTRL_BITS_GAIN_DATA         32
++ #define XAXIS_SCALER_CTRL_BITS_GAIN_DATA         16
+```
+
+E nel banco registri:
+
+```diff
+- gain : out STD_LOGIC_VECTOR(31 downto 0);
++ gain : out STD_LOGIC_VECTOR(15 downto 0);
+- int_gain(31 downto 0) <= (UNSIGNED(WDATA(31 downto 0)) and wmask(31 downto 0)) or ...
++ int_gain(15 downto 0) <= (UNSIGNED(WDATA(15 downto 0)) and wmask(15 downto 0)) or ...
+```
+
+Non c'è **nessuna** logica che "sa" della virgola. Il software scrive 16 bit
+(per gain = 1,5 scrive 24576, cioè 1,5 × 2¹⁴), il banco registri li conserva,
+il moltiplicatore li moltiplica come un intero con segno. Che quei 16 bit
+valgano 1,5 e non 24576 è una convenzione su come leggere il risultato — e
+quella convenzione, in hardware, è **la posizione della fetta** di bit che si
+tiene del prodotto. È il punto successivo.
+
+Corollario per il driver: la quantizzazione da numero reale a Q2.14 è **lavoro
+del software**, e ha un range check non opzionale. Verificato con il
+compilatore: `gain_t g = 2.0;` non dà errore e **avvolge a −2,0** (`0x8000`),
+perché il massimo del formato è 2 − 2⁻¹⁴ = 1,99993896. Un driver che scrive
+"2.0" nel registro inverte il segno del segnale. Il testbench ha la sua
+`q2_14()` che rifiuta i valori fuori range, ed è esattamente la funzione che
+il driver dovrà avere.
+
+### Dove si perdono i bit: il VHDL di AP_RND e AP_SAT
+
+Il prodotto esatto ha 48 bit, Q34.14. L'uscita ne tiene 32. Il tool ha fatto
+quattro fette del prodotto, tutte registrate nello stesso stadio:
+
+```vhdl
+prodotto_reg_457 <= prodotto_fu_162_p2;                  -- i 48 bit interi
+y_reg_470        <= prodotto_fu_162_p2(45 downto 14);    -- i 32 bit che "ci stanno"
+tmp_1_reg_475    <= prodotto_fu_162_p2(13 downto 13);    -- il bit "metà": l'unico frazionario che serve
+tmp_5_reg_480    <= prodotto_fu_162_p2(47 downto 46);    -- i 2 bit interi in più
+```
+
+**La fetta `(45 downto 14)` è la virgola.** Scartare i 14 bit bassi *è*
+dividere per 2¹⁴; tenere i 32 bit sopra *è* il risultato intero. Non c'è
+un'operazione "converti da virgola fissa a intero": c'è solo la scelta di
+quali fili portare avanti.
+
+**AP_RND** è un incrementatore a 32 bit che somma il bit 13 alla fetta:
+
+```vhdl
+y_1_fu_266_p2 <= std_logic_vector(unsigned(y_reg_470) + unsigned(zext_ln299_fu_263_p1));
+                                                        -- zext di tmp_1_reg_475, il bit 13
+```
+
+La definizione dell'header (*rounding to plus infinity*: il bit scartato più
+alto viene sommato, sempre) e la formula del golden model (floor(v + ½)) sono
+la stessa cosa scritta in due modi: `(p + 2¹³) >> 14` ≡ `(p >> 14) + bit13(p)`.
+Il tool ha scelto la seconda, e infatti dei 14 bit frazionari ne ha registrato
+**uno solo**: gli altri 13 non possono influenzare il risultato, e non
+esistono più. Costo: 32 LUT (la voce `y_1_fu_266_p2 | + | 32`).
+
+**AP_SAT** è un confronto sui bit alti e due mux:
+
+```vhdl
+-- i due bit interi in più sono estensione del segno del bit 45?
+icmp_ln299_1_fu_303_p2 <= "1" when (tmp_5_reg_480 = ap_const_lv2_0) else "0";   -- "00"
+icmp_ln299_fu_298_p2   <= "1" when (tmp_5_reg_480 = ap_const_lv2_3) else "0";   -- "11"
+-- se no: quale estremo?
+select_ln299_2_fu_387_p3 <= ap_const_lv32_7FFFFFFF when (and_ln299_3_fu_358_p2(0) = '1') else
+                            ap_const_lv32_80000000;
+-- il valore o l'estremo
+m_axis_TDATA_int_regslice <= select_ln299_2_fu_387_p3 when (or_ln299_1_fu_395_p2(0) = '1') else
+                             y_1_fu_266_p2;
+```
+
+Un valore Q34.14 "ci sta" in 32 bit interi se i bit 47, 46 e 45 sono uguali,
+cioè se i due bit in più sono pura estensione del segno. In mezzo ci sono una
+quindicina di `and`/`or`/`xor` a un bit, che gestiscono il caso in cui è
+l'**arrotondamento** a far traboccare (0x7FFFFFFF + 1): è il `carry &&
+!bit(W-1)` che si legge in `quantization_adjust` nell'header del tool. Costo:
+30 + 29 LUT per i due mux a 32 bit, più i confronti.
+
+In VHDL sarebbe `resize(prodotto, 31, 0, fixed_saturate, fixed_round)` di
+`ieee.fixed_pkg` — e vale la pena notare che fixed_pkg ha **i default
+opposti** (`fixed_round`, `fixed_saturate`) rispetto ad `ap_fixed` (`AP_TRN`,
+`AP_WRAP`). Chi passa da uno all'altro e non scrive i modi esplicitamente si
+porta dietro una differenza silenziosa.
+
+### Il conto dei FF: una stima da leggere con occhio
+
+Dove sono finiti i +38 FF, per voce del report:
+
+```text
+                     1.5              1.6
+Instance         158 FF (mul 46,     96 FF (mul 0,        il moltiplicatore è tutto nei DSP;
+                  ctrl 112)           ctrl 96)             gain nel banco: 32 -> 16 bit
+Register         140 FF             240 FF                +100
+```
+
+E i 240 FF di *Register*, guardando le voci larghe:
+
+| Registro | FF | Cosa contiene |
+|---|---|---|
+| `p_0_reg_432` | 32 | il campione letto (c'era anche prima) |
+| `conteggio_fu_106` | 31 | il contatore (1.4) |
+| `sext_ln274_reg_426` | **48** | `gain` esteso con segno a 48 bit — di cui il moltiplicatore legge `(15 downto 0)` |
+| `prodotto_reg_457` | **48** | il prodotto intero — di cui il ciclo dopo legge **due bit** (45 e 46) |
+| `y_reg_470` | 32 | la fetta `(45 downto 14)` dello stesso prodotto |
+
+Al 1.5 `gain` occupava `gain_read_reg_202` a 32 bit; ora occupa 48 FF per 16
+bit di informazione, e il prodotto è registrato due volte (intero, e la fetta).
+Circa **78 di questi FF non sono letti da nessuno** o duplicano bit che stanno
+altrove: la sintesi logica di Vivado li toglierà. Il report di `csynth` è una
+**stima prima dell'ottimizzazione**, e su questo gradino sovrastima. I numeri
+veri li dà il passo *IMPLEMENTATION* della GUI (che lancia Vivado sull'RTL):
+lo faremo in Fase 2, e questo è il caso da usare per vedere di quanto la stima
+si discosta.
+
+La lezione non è "il tool spreca": è che **a livello di sintesi HLS i FF sono
+un'astrazione** — segnali intermedi registrati fra uno stadio e l'altro — e il
+conto fisico lo fa un altro strumento più a valle. I DSP invece sono contati
+bene: sono istanze, non stime.
+
+### Il testbench: tre cose nuove, e un test che doveva fallire
+
+**1) La quantizzazione è del software.** `q2_14(double, int16_t&)` moltiplica
+per 2¹⁴, arrotonda e controlla il range; il `gain_t` per il DUT si costruisce
+dai bit grezzi con `g.range(15, 0) = raw`, cioè come farà la scrittura AXI a
+0x10. È l'unico punto del testbench che tocca `ap_fixed`, e lo fa senza
+conversioni. Un auto-test del quantizzatore fissa i fatti del formato:
+1,0 → 16384, 0,5 → 8192, −2,0 → −32768, 1,99993896 → 32767, 2⁻¹⁴ → 1, e
+**2,0 → rifiutato**.
+
+**2) Il golden model non usa `ap_fixed`.** `long long`, una divisione con
+floor esplicito (in C la divisione tronca verso zero: −3/2 = −1, non −2, e per
+i negativi con resto va corretta) e due `if`:
+
+```cpp
+long long prodotto = (long long)x * raw_gain;             // x * gain * 2^14, esatto
+long long r        = floor_div_2p14(prodotto + (1 << 13)); // AP_RND: + mezzo LSB, poi floor
+if (r > INT_MAX) r = INT_MAX;                             // AP_SAT
+if (r < INT_MIN) r = INT_MIN;
+```
+
+Stesso numero del DUT per una strada diversa: `(p + 2¹³) >> 14` nel modello,
+`(p >> 14) + bit13` nell'hardware.
+
+**3) Stimoli scelti per far scattare le due decisioni.** Con il pattern dei
+gradini precedenti e gain interi, arrotondamento e saturazione non
+intervengono mai. Servono:
+
+- x dispari × 0,5: prodotti **esattamente a metà**. 50,5 → 51 e −50,5 → **−50**
+  (verso +∞, non "via dallo zero": è la definizione di `AP_RND`; per un
+  arrotondamento senza bias il modo è `AP_RND_CONV`);
+- x = ±(100..103) × 0,25: i quarti, 25,25 → 25, 25,5 → 26, 25,75 → 26;
+- `INT_MAX × 1,5`, `INT_MIN × 1,5`: saturano; `2³⁰ × 1,5` in mezzo: esatto;
+- **`INT_MIN × −1,0`**: il prodotto esatto è +2³¹, che in 32 bit con segno non
+  esiste. Con il wrap del 1.3 dava `INT_MIN` — il segno sbagliato, in silenzio.
+  Ora dà `INT_MAX`: sbagliato di uno, nel verso giusto. È il caso che
+  giustifica `AP_SAT` da solo.
+
+Quattordici casi più l'auto-test, `csim` verde; `cosim` **Pass** su tutti e
+quattordici, latenza ancora N + 4: arrotondamento e saturazione sono entrati
+nei quattro stadi che c'erano.
+
+Una nota sul sorgente committato a questo gradino: il `#pragma HLS PIPELINE
+II=1` del 1.5 è stato **commentato di proposito** (scelta di chi studia, per
+tenere sotto mano il caso "senza"). Il build è stato rifatto così, e conferma
+§8 su questo design: `Target II = NA, Final II = 1`, `inferred_directives.ini`
+ricompare, e numeri identici — 2 DSP, 336 FF, 394 LUT, 2,726 ns, cosim Pass.
+Resta valido quanto detto in §8 su ciò che si perde: la blindatura contro un
+`pipeline_loops=0` nel cfg.
+
+**Due verifiche del testbench stesso.** Un test che passa prova poco se non si
+sa che *saprebbe* fallire:
+
+- il **vecchio testbench** (1.5) fatto girare contro questo DUT: **46 errori**.
+  Passava gain interi, che ora vengono convertiti in Q2.14 avvolgendo: `2` →
+  −2,0 (uscite a segno invertito), `−3` → +1,0 (uscita = ingresso),
+  `100000000` → 0,0. Solo `1` e `0` passano. Il caso "gain enorme: verifica il
+  TRONCAMENTO" del 1.3 diceva di sé *«se un giorno aggiungeremo la saturazione,
+  il fatto che FALLISCA sarà la prova che funziona»*: eccolo;
+- un **mutante** con `out_t` ai modi di default (`AP_TRN`, `AP_WRAP`), stesso
+  testbench: **23 errori**, tutti e soli nei casi a metà e ai bordi; i casi con
+  gain 1, 0, −1, −2 (prodotto esatto) restano verdi. Dettaglio da tenere: con
+  gain = 1,99994 il troncamento dà 199 dove serve 200 su *ogni* campione
+  positivo — è il bias sistematico verso il basso di `AP_TRN`, la ragione
+  statistica per cui `AP_RND` esiste.

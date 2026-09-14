@@ -280,11 +280,15 @@ larghezza degli operandi:
 
 | Operandi | DSP |
 |---|---|
-| 32 × 32 (l'`axis_scaler` attuale) | **4** |
+| 32 × 32 (l'`axis_scaler` fino al 1.5) | **4** |
+| 32 × 16 (l'`axis_scaler` dal 1.6, `gain` in Q2.14) | **2** |
 | 16 × 16 | **1** |
 
 Quattro volte meno silicio per la stessa moltiplicazione. **La larghezza dei bit
-decisa prima di arrivare a HLS determina quanto hardware pagherai.**
+decisa prima di arrivare a HLS determina quanto hardware pagherai.** La riga
+di mezzo è stata misurata al gradino 1.6 (`docs/00` §9) ed era stata prevista
+prima di sintetizzare: il DSP58 di Versal è un moltiplicatore 27×24, quindi un
+operando a 32 bit costa due tagli e uno a 16 bit uno solo — 2×1 = 2 DSP.
 
 Sono due domande diverse, con due strumenti diversi:
 
