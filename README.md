@@ -5,7 +5,7 @@ dati **AXI4-Stream** e banco registri **AXI4-Lite** (configurazione, stato,
 controllo, interrupt), fino a farla entrare nel catalogo IP di Vivado come una
 IP AMD.
 
-**Stato attuale: gradino 1.6 — virgola fissa, arrotondamento e saturazione.**
+**Stato attuale: gradino 1.7 — le statistiche in variabili `static`.**
 
 ---
 
@@ -70,7 +70,7 @@ cambiato nell'hardware generato.
 | 1.4 | Primo registro di stato | Un output è un puntatore perché il C lo dice. Nasce `sample_count` a 0x18 e il bit `_ap_vld` a 0x1c, nello slot che al 1.3 era `reserved` | ✅ fatto |
 | 1.5 | Controllo esplicito del pipeline | Che `PIPELINE II=1` non cambia un filo (lo faceva già il tool), cosa sono davvero II e iteration latency, e che forzare `II=2`/`4` qui non compra un DSP: `TREADY` un ciclo sì e uno no, e la sola cosa che sparisce sono i registri dei campioni in volo | ✅ fatto |
 | 1.6 | `ap_fixed` per il guadagno, `AP_RND` + `AP_SAT` sul prodotto | Il registro trasporta bit grezzi (`gain[15:0]`), la virgola è una fetta di fili, i DSP scendono da 4 a 2 come previsto; `AP_RND` è un incrementatore sul bit 13, `AP_SAT` un confronto sui due bit alti e un mux. E `2.0` in Q2.14 non esiste | ✅ fatto |
-| 1.7 | Statistiche in variabili `static` | Registri che sopravvivono, e il reset | — |
+| 1.7 | Statistiche in variabili `static` (`total_samples`, `packet_count`) | Una `static` è un registro con enable e basta: niente mux di azzeramento (quelli di `conteggio` sono di `ap_loop_init`, non del reset — corretto il §7), e con `reset=control` nessun ramo di reset, solo il `:=` di accensione (`WARNING 206-101`). `state` aggiunge il reset alle sole `static`, `all` a tutto. Due sorprese: ogni puntatore riserva 16 byte (0x28, 0x38, con buchi) e la `static` fa estrarre il loop in un modulo `ap_ctrl_hs` a sé, con il top che diventa una FSM a 4 stati: +2 cicli per transazione | ✅ fatto |
 | 1.8 | Registri a campi di bit, flag sticky | Come si scrive un registro industriale | — |
 | 1.9 | Watchdog | Come un IP si difende da un `TLAST` mancante | — |
 

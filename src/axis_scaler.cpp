@@ -2,24 +2,23 @@
 //  axis_scaler.cpp  --  Implementazione della top function
 // =============================================================================
 //
-//  GRADINO 1.6  --  VIRGOLA FISSA, ARROTONDAMENTO E SATURAZIONE
+//  GRADINO 1.7  --  LE STATISTICHE IN VARIABILI static
 //
-//  Fino al 1.5 il calcolo era  y = x * gain  con gain intero, e il prodotto
-//  veniva TRONCATO ai 32 bit bassi: per un guadagno grande il risultato
-//  avvolgeva, e il testbench lo documentava come "comportamento reale".
+//  Fino al 1.6 la IP non ricordava niente da un pacchetto all'altro: ogni
+//  ap_start ripartiva da zero, e sample_count riportava la lunghezza
+//  dell'ULTIMO pacchetto (il test "3 poi 5, non 8" lo fissa).
 //
-//  Ora il guadagno e' un numero in virgola fissa Q2.14 (vedi axis_scaler.hpp)
-//  e il prodotto viene:
+//  Ora due variabili "static" accumulano fra le chiamate:
 //
-//        calcolato ESATTO su 48 bit             (prod_t)
-//        ARROTONDATO al piu' vicino             (AP_RND)
-//        SATURATO se non sta in 32 bit          (AP_SAT)
+//        tot_campioni    quanti campioni sono usciti da quando la IP esiste
+//        tot_pacchetti   quante transazioni sono state completate
 //
-//  Tre righe di C al posto di una. Quello che c'e' da capire in questo
-//  gradino sta tutto in DOVE i bit si perdono, e in quanto hardware costano
-//  le due decisioni: la previsione, scritta prima di sintetizzare, e' che il
-//  moltiplicatore scenda da 4 a 2 DSP (un operando e' passato da 32 a 16 bit)
-//  e che AP_RND e AP_SAT compaiano come un sommatore e un mux in piu'.
+//  In C "static" vuol dire "questa variabile vive per tutta la durata del
+//  programma, non dello stack della funzione". In hardware vuol dire una cosa
+//  molto precisa, ed e' il punto del gradino: un REGISTRO che nessun ap_start
+//  azzera, e che ha un rapporto tutto suo con ap_rst_n. Quale, lo decide una
+//  riga di hls_config.cfg (syn.rtl.reset), e questo gradino la prova in tutte
+//  e tre le forme: control, state, all.
 //
 // =============================================================================
 #include "axis_scaler.hpp"
@@ -28,339 +27,230 @@
 void axis_scaler(hls::stream<pkt_t> &s_axis,
                  hls::stream<pkt_t> &m_axis,
                  gain_t              gain,
-                 int                *sample_count)
+                 int                *sample_count,
+                 unsigned int       *total_samples,
+                 unsigned int       *packet_count)
 {
     // =========================================================================
     //  I PRAGMA DI INTERFACCIA
     // =========================================================================
     //
-    //  Non cambiano NIENTE di quello che il codice calcola: decidono soltanto
-    //  con quale protocollo hardware i dati entrano ed escono dal modulo.
-    //
-    //  E' la differenza culturale piu' grande rispetto al VHDL. In VHDL
-    //  dichiari le porte e poi scrivi a mano la logica che rispetta il
-    //  protocollo. In HLS descrivi l'algoritmo, e con i pragma dici al tool
-    //  "questo argomento me lo esponi come AXI4-Stream" -- la logica di
-    //  handshake la genera lui.
+    //  Non cambiano NIENTE di quello che il codice calcola: decidono con
+    //  quale protocollo i dati entrano ed escono. In VHDL scrivi le porte e
+    //  poi la logica di protocollo a mano; qui descrivi l'algoritmo e il
+    //  pragma dice "questo argomento esponilo cosi'", l'handshake lo genera
+    //  il tool.
     // -------------------------------------------------------------------------
 
-    // --- Lo stream di ingresso: porta AXI4-Stream SLAVE ----------------------
+    // --- Gli stream: porte AXI4-Stream SLAVE e MASTER (INVARIATO dal 1.1) ---
     //
-    //  Genera:  s_axis_TDATA[31:0]  s_axis_TVALID  s_axis_TREADY
-    //           s_axis_TKEEP[3:0]   s_axis_TSTRB[3:0]  s_axis_TLAST
-    //
-    //  INVARIATO dai gradini precedenti.
+    //  Generano TDATA[31:0] TVALID TREADY TKEEP[3:0] TSTRB[3:0] TLAST, con le
+    //  direzioni invertite fra le due.
     //
 #pragma HLS INTERFACE mode=axis port=s_axis
-
-    // --- Lo stream di uscita: porta AXI4-Stream MASTER -----------------------
-    //
-    //  Stessi segnali, direzioni invertite.
-    //
-    //  INVARIATO dai gradini precedenti.
-    //
 #pragma HLS INTERFACE mode=axis port=m_axis
 
-    // --- Il controllo del blocco su AXI4-Lite --------------------------------
+    // --- Il controllo del blocco su AXI4-Lite (INVARIATO dal 1.2) -----------
     //
-    //  Genera s_axi_ctrl (i cinque canali AXI4-Lite), il pin interrupt e i
-    //  quattro registri CTRL/GIER/IER/ISR agli offset 0x00..0x0C.
-    //
-    //  Ricorda il punto del gradino 1.2: s_axilite NON sostituisce ap_ctrl_hs.
-    //  Il protocollo a livello di blocco resta quello -- "una chiamata della
-    //  funzione = una transazione dell'IP" -- e ap_start/ap_done/ap_idle/
-    //  ap_ready esistono ancora come segnali interni. Cambia solo il modo di
-    //  raggiungerli: una scrittura sul bus invece di un pin.
-    //
-    //  INVARIATO dal gradino 1.2.
+    //  Genera s_axi_ctrl, il pin interrupt e CTRL/GIER/IER/ISR a 0x00..0x0C.
+    //  Non sostituisce ap_ctrl_hs: "una chiamata = una transazione" resta, e
+    //  ap_start/ap_done diventano bit di un registro invece di pin.
     //
 #pragma HLS INTERFACE mode=s_axilite port=return bundle=ctrl
 
-    // --- Il registro di configurazione (gradino 1.3) -------------------------
+    // --- Il registro di configurazione (INVARIATO dal 1.3, tipo dal 1.6) ----
     //
-    //  gain vive a 0x10. Offset scelto da HLS, non da noi: 0x00..0x0C sono
-    //  riservati al blocco di controllo standard AMD, e i registri utente
-    //  partono da li' nell'ordine in cui compaiono gli argomenti.
-    //
-    //  Viene campionato all'ap_start e resta congelato per tutta la
-    //  transazione: in C un parametro non cambia mentre la funzione gira, e in
-    //  hardware vale la stessa cosa.
-    //
-    //  Il pragma e' INVARIATO dal gradino 1.3. Quello che cambia al 1.6 e' il
-    //  tipo dell'argomento, e con lui la larghezza del registro: 16 bit utili
-    //  su una parola da 32. Il software ci scrive i bit grezzi del Q2.14 --
-    //  per gain = 0.5 scrive 8192, per gain = 1.5 scrive 24576 -- e nessuna
-    //  logica in hardware "interpreta" la virgola: e' solo un modo di leggere
-    //  quei 16 bit quando entrano nel moltiplicatore.
+    //  gain a 0x10, 16 bit utili, campionato all'ap_start. Il registro
+    //  trasporta i bit grezzi del Q2.14 (docs/00 par. 9).
     //
 #pragma HLS INTERFACE mode=s_axilite port=gain bundle=ctrl
 
-    // --- Il registro di stato (gradino 1.4) ----------------------------------
+    // --- Il registro di stato per-pacchetto (INVARIATO dal 1.4) -------------
     //
-    //  Stessa riga di gain, ma nella firma sample_count e' un PUNTATORE: e' da
-    //  li' -- non dal pragma -- che il tool capisce che e' un'uscita.
-    //
-    //        stesso pragma + argomento per valore     -> registro scrivibile
-    //        stesso pragma + argomento per puntatore  -> registro leggibile
-    //
-    //  Produce, dentro axis_scaler_ctrl_s_axi.vhd, un registro a 32 bit
-    //  caricato dal DATAPATH (a 0x18, Read) e un bit di validita'
-    //  sample_count_ap_vld (a 0x1c, Read/COR) nello slot che per gain era
-    //  "reserved": un latch acceso da un impulso dell'hardware e spento
-    //  dalla lettura del software, lo stesso idioma di ap_done. E' il TVALID
-    //  di AXI4-Stream applicato a un registro. Dettagli in docs/00 par. 7.
-    //
-    //  INVARIATO dal gradino 1.4.
+    //  Stesso pragma di gain, ma l'argomento e' un PUNTATORE: registro a 0x18
+    //  scritto dal datapath, piu' il bit sample_count_ap_vld a 0x1c
+    //  (Read/COR), un latch acceso da un impulso e spento dalla lettura --
+    //  lo stesso idioma di ap_done (docs/00 par. 7).
     //
 #pragma HLS INTERFACE mode=s_axilite port=sample_count bundle=ctrl
 
+    // --- I DUE REGISTRI DI STATO CUMULATIVI (la novita' del 1.7) ------------
+    //
+    //  Stessa riga di sample_count, due volte. Il pragma NON sa che dietro
+    //  c'e' una static: produce esattamente quello che ha prodotto al 1.4, un
+    //  registro a 32 bit + un bit _ap_vld ciascuno, nel banco registri.
+    //
+    //  Previsione sugli offset: 0x20/0x24 e 0x28/0x2c. E 0x2c e' oltre i 32
+    //  byte che 5 bit di indirizzo coprono: ADDR_BITS 5 -> 6, e nella entity
+    //  top C_S_AXI_CTRL_ADDR_WIDTH 5 -> 6.
+    //  (Misurato: 0x28/0x2c e 0x38/0x3c -- ogni puntatore riserva 16 byte.
+    //  ADDR_BITS 6 come previsto. Dettagli in axis_scaler.hpp e docs/00.)
+    //
+    //  Quello che la static cambia NON e' nel banco registri: e' nel
+    //  datapath, dove sta la variabile. Vedi sotto.
+    //
+#pragma HLS INTERFACE mode=s_axilite port=total_samples bundle=ctrl
+#pragma HLS INTERFACE mode=s_axilite port=packet_count  bundle=ctrl
+
 
     // =========================================================================
-    //  L'ALGORITMO
+    //  LE VARIABILI static  --  LA MODIFICA DEL GRADINO 1.7
+    // =========================================================================
+    //
+    //  Confronto con la riga  int conteggio = 0;  piu' sotto, che e' locale:
+    //
+    //        locale   -> un registro che riparte da 0 a OGNI ap_start.
+    //                    Nell'RTL del 1.6 quel "riparte da 0" costa due mux
+    //                    a 31 bit governati da ap_loop_init (docs/00 par. 7):
+    //                    e' il phi-node della prima iterazione.
+    //
+    //        static   -> un registro che parte da 0 UNA volta sola, quando
+    //                    il chip viene configurato, e poi non viene mai piu'
+    //                    azzerato dalla funzione. Nessun ap_loop_init lo
+    //                    tocca: previsione, sommatore -> registro, senza mux.
+    //
+    //  In VHDL e' la differenza fra una "variable" di process (che in
+    //  pratica nessuno userebbe per questo) e un
+    //
+    //        signal tot_campioni : unsigned(31 downto 0) := (others => '0');
+    //
+    //  dichiarato nell'architecture, con l'aggiornamento sotto un enable.
+    //  Nota il := (others => '0'): e' il valore INIZIALE, quello che la FPGA
+    //  carica nei flip-flop alla configurazione (attributo INIT). Non e' un
+    //  reset. La differenza fra i due e' TUTTO l'esperimento di questo
+    //  gradino, e sta in una chiave di hls_config.cfg:
+    //
+    //        syn.rtl.reset=control   (il nostro)  ap_rst_n azzera SOLO la FSM
+    //                                e i segnali di protocollo. Le static
+    //                                hanno il := iniziale e basta: previsione,
+    //                                NESSUN  if (ap_rst_n_inv = '1')  sui
+    //                                loro processi.
+    //
+    //        syn.rtl.reset=state     come control, PIU' le static: un ramo di
+    //                                reset sui due registri qui sotto, e
+    //                                niente altro.
+    //
+    //        syn.rtl.reset=all       tutto: anche i registri di pipeline del
+    //                                datapath (p_0_reg, prodotto_reg, y_reg,
+    //                                conteggio...) prendono il ramo di reset.
+    //
+    //  E' una scelta di PROGETTO, non di stile. Nel banco registri la copia
+    //  int_sample_count E' azzerata da ARESET (axis_scaler_ctrl_s_axi.vhd del
+    //  1.6, riga 465). Con reset=control, dopo un impulso di ap_rst_n a meta'
+    //  vita, il software leggerebbe 0 a 0x20 (copia resettata) e poi, dopo il
+    //  pacchetto seguente, vecchio_totale + n (la static non lo era). Un
+    //  registro che torna a zero e poi salta: e' il motivo per cui esistono
+    //  reset=state, e in software il CLEAR_STATS del gradino 1.8.
+    //
+    //  Il = 0 e' obbligatorio per il ragionamento sopra: una static senza
+    //  inizializzatore in C vale comunque 0, ma scriverlo rende esplicito
+    //  qual e' il valore di INIT del flip-flop.
+    // -------------------------------------------------------------------------
+    static unsigned int tot_campioni  = 0;
+    static unsigned int tot_pacchetti = 0;
+
+
+    // =========================================================================
+    //  L'ALGORITMO  (INVARIATO dal 1.6 dentro il loop)
     // =========================================================================
 
     bool ultimo = false;
 
     // -------------------------------------------------------------------------
-    //  IL CONTATORE
+    //  IL CONTATORE PER-PACCHETTO (INVARIATO dal 1.4)
     //
-    //  Una variabile locale, non static. E' importante notarlo adesso perche'
-    //  determina il comportamento fra una transazione e l'altra:
-    //
-    //        locale  -> riparte da 0 a ogni chiamata della funzione, cioe' a
-    //                   ogni ap_start. Il registro riporta la lunghezza
-    //                   dell'ULTIMO pacchetto, non un totale.
-    //
-    //  E' quello che vogliamo qui: "quanti campioni aveva questo pacchetto".
-    //  Le statistiche che si ACCUMULANO fra i pacchetti (totale campioni,
-    //  conteggio pacchetti, min, max) richiedono variabili static, e sono il
-    //  gradino 1.7: li' vedremo che HLS genera registri che sopravvivono alla
-    //  fine della funzione, e che il reset li tratta in modo diverso.
-    //
-    //  In hardware questa variabile diventa un registro a 32 bit piu' un
-    //  sommatore: l'equivalente esatto di un
-    //
-    //        signal conteggio : unsigned(31 downto 0);
-    //        ...
-    //        conteggio <= conteggio + 1;
-    //
-    //  dentro un process, con l'azzeramento fatto all'inizio della transazione
-    //  invece che dal reset globale.
+    //  Locale, NON static, di proposito: riparte da 0 a ogni chiamata e il
+    //  registro riporta la lunghezza dell'ULTIMO pacchetto. E' il termine di
+    //  paragone delle due static qui sopra: stesso sommatore, ma con i due
+    //  mux di azzeramento che una static non ha.
     // -------------------------------------------------------------------------
     int conteggio = 0;
 
     // -------------------------------------------------------------------------
-    //  L'etichetta "copia_pacchetto:" non e' decorativa.
-    //
-    //  HLS usa le etichette dei loop come nomi nei report di sintesi e nello
-    //  Schedule Viewer. Un loop senza etichetta compare come "VITIS_LOOP_92_1"
-    //  e quando ne hai cinque non capisci piu' niente. Etichettare i loop e'
-    //  una abitudine da IP professionale, come dare un nome ai process VHDL.
-    //
-    //  (Il nome resta "copia_pacchetto" anche se ora non copia soltanto: lo
-    //  cambieremo quando l'elaborazione sara' completa, per non falsare i
-    //  confronti dei report fra un gradino e l'altro.)
+    //  L'etichetta e' il nome del loop nei report e nello Schedule Viewer.
+    //  (Il nome "copia_pacchetto" resta per non falsare i confronti fra
+    //  gradini, anche se ormai non copia soltanto.)
     // -------------------------------------------------------------------------
     copia_pacchetto:
     while (!ultimo) {
 
-        // =====================================================================
-        //  LA MODIFICA DEL GRADINO 1.5: il pipeline dichiarato per iscritto
-        // =====================================================================
+        // ---------------------------------------------------------------------
+        //  PIPELINE (gradino 1.5, docs/00 par. 8): il pragma sta DENTRO il
+        //  loop. Produce lo stesso RTL che il tool genera da solo con il
+        //  default pipeline_loops=64; la riga blinda "un campione per clock"
+        //  contro un cfg con pipeline_loops=0.
         //
-        //  Il pragma sta DENTRO il corpo del loop, non prima dell'etichetta:
-        //  e' la sintassi di HLS, e si applica al loop che lo contiene. E' la
-        //  prima cosa che sorprende venendo dal VHDL.
-        //
-        //  COSA PRODUCE FISICAMENTE: NIENTE DI NUOVO. L'RTL e' identico a
-        //  quello del gradino 1.4, byte per byte (verificato con il diff del
-        //  VHDL, docs/00 par. 8): dalla versione 2020.2 il tool pipelina da
-        //  solo i loop, e questo lo aveva gia' fatto. Lo confessa lui stesso
-        //  in syn/inferred_directives.ini del build 1.4:
-        //
-        //        # Inferred from syn.compile.pipeline_loops=64
-        //        syn.directive.pipeline=axis_scaler/copia_pacchetto
-        //
-        //  I DUE NUMERI DEL REPORT, che si confondono facilmente:
-        //
-        //    Iteration Latency = 4   quanti cicli impiega UN campione ad
-        //                            attraversare il corpo del loop: il
-        //                            moltiplicatore 32x32 non sta in 4 ns e
-        //                            il tool lo ha spezzato in 4 stadi.
-        //
-        //    II = 1                  ogni quanti cicli PUO' ENTRARE un campione
-        //    (Initiation Interval)   NUOVO. Non aspetta che il precedente sia
-        //                            uscito: fino a 4 campioni "in volo"
-        //                            insieme, uno per stadio. Una catena di
-        //                            montaggio, non uno sportello.
-        //
-        //  In termini di fili: II=1 vuol dire che s_axis_TREADY puo' stare
-        //  alto a OGNI colpo di clock. Con II=2 il modulo lo alzerebbe un
-        //  ciclo si' e uno no -- backpressure che si impone da solo, meta' del
-        //  throughput. In VHDL sarebbe il contatore di fase di un datapath
-        //  condiviso,  ready <= '1' when fase = 0 else '0';  con i mux sugli
-        //  operandi scritti a mano. Qui li genera lo scheduler.
-        //
-        //  A cosa serve, allora, un II piu' alto? A CONDIVIDERE hardware: con
-        //  II=2 due operazioni dello stesso tipo nella stessa iterazione
-        //  possono usare a turno lo stesso operatore fisico (docs/05 par. 3,
-        //  il FIR con 8 moltiplicazioni su 4 DSP). Ma qui di moltiplicazione
-        //  ce n'e' UNA per iterazione: non c'e' niente da mettere a turno.
-        //  Misurato (docs/00 par. 8): con II=2 i DSP restano 4 e il
-        //  moltiplicatore e' lo stesso modulo; spariscono solo 56 FF di
-        //  registri di pipeline, in cambio di meta' del throughput.
-        //
-        //  PERCHE' LA RIGA RESTA, se non cambia niente: perche' "un campione
-        //  per clock" e' la SPECIFICA di questa IP, e va scritta dove si legge
-        //  il codice, non lasciata a un default (pipeline_loops=64) che
-        //  chiunque puo' cambiare in hls_config.cfg senza toccare il sorgente.
-        //  Verificato: con  syn.compile.pipeline_loops=0  nel cfg, il sorgente
-        //  del 1.4 sintetizza un loop NON pipelinato -- 3 cicli per campione,
-        //  4 stati di FSM -- senza un solo warning. Con questa riga resta
-        //  II=1. Un vincolo dichiarato si vede; un default si eredita.
-        //
-        //  Nella GUI: pannello HLS DIRECTIVES, cursore sul loop, "+", PIPELINE,
-        //  II=1. Destinazione "Source file" scrive questa riga; "Config file"
-        //  scrive invece in hls_config.cfg la forma equivalente
-        //        syn.directive.pipeline=axis_scaler/copia_pacchetto II=1
-        //  che e' quella usata per lo sweep in scratchpad.
-        //
-        //  NOTA (gradino 1.6): la riga qui sotto e' COMMENTATA di proposito,
-        //  per scelta di chi sta studiando. Con il default pipeline_loops=64
-        //  il tool la deduce da solo (ricompare syn/inferred_directives.ini,
-        //  il log dice "Target II = NA, Final II = 1") e l'RTL e' identico.
-        //  Quello che si perde e' solo la blindatura contro un cfg diverso,
-        //  descritta sopra. Per riattivarla basta togliere le due barre.
+        //  COMMENTATA DI PROPOSITO dal 1.6, per scelta di chi studia: il
+        //  build e' fatto senza (Target II = NA, Final II = 1, RTL identico).
+        //  Per riattivarla basta togliere le due barre.
         // ---------------------------------------------------------------------
 //#pragma HLS PIPELINE II=1
 
-        // --- LETTURA BLOCCANTE ------------------------------------------------
-        //
-        //  .read() in hardware diventa:
-        //
-        //        "alza s_axis_TREADY, e aspetta il colpo di clock in cui
-        //         anche s_axis_TVALID e' alto; in quel ciclo cattura TDATA"
-        //
-        //  E' bloccante: se il produttore a monte non ha dati, il modulo si
-        //  ferma. Non e' un errore, e' esattamente la backpressure di AXI.
-        //
+        // --- LETTURA BLOCCANTE: TREADY alto, cattura al ciclo con TVALID ---
         pkt_t campione = s_axis.read();
 
-        // --- Il campo .last e' TLAST -----------------------------------------
-        //
-        //  E' un ap_uint<1>, quindi lo confrontiamo esplicitamente con 1
-        //  invece di usarlo come booleano: piu' chiaro e senza warning.
-        //
+        // --- .last e' TLAST -------------------------------------------------
         ultimo = (campione.last == 1);
 
-        // =====================================================================
-        //  IL CALCOLO  --  LA MODIFICA DEL GRADINO 1.6
-        // =====================================================================
+        // --- IL CALCOLO (INVARIATO dal 1.6, docs/00 par. 9) -----------------
         //
-        //  Al 1.3 era una riga:   campione.data = campione.data * gain;
-        //  con gain intero e il prodotto troncato ai 32 bit bassi. Ora sono
-        //  tre, e ognuna risponde a una domanda diversa.
-        //
-        //  1) IL PRODOTTO ESATTO. Un ap_int<32> per un ap_fixed<16,2> da' un
-        //     ap_fixed<48,34>: 48 bit, nessuna perdita, per qualunque coppia
-        //     di operandi. E' la "crescita dei bit" di fixed_pkg:
-        //
-        //           sfixed(31 downto 0) * sfixed(1 downto -14) = sfixed(33 downto -14)
-        //
-        //     In hardware e' il moltiplicatore. Previsione: 2 DSP invece di 4,
-        //     perche' un operando e' sceso da 32 a 16 bit e il DSP58 di
-        //     Versal e' un 27x24 -- 32 bit richiedono due tagli, 16 uno solo.
+        //  prodotto esatto a 48 bit (2 DSP), poi AP_RND (incrementatore sul
+        //  bit 13) e AP_SAT (confronto bit 47..45 + mux) nell'assegnazione a
+        //  out_t; l'ultima riga e' un filo.
         //
         prod_t prodotto = campione.data * gain;
+        out_t  y        = prodotto;
+        campione.data   = y;
 
-        //  2) LA DECISIONE. Assegnare un Q34.14 a un tipo da 32 bit interi
-        //     butta via 14 bit frazionari e 2 bit interi. COME buttarli via
-        //     lo dicono i modi del tipo di DESTINAZIONE, out_t:
-        //
-        //           AP_RND   14 bit frazionari  ->  arrotonda al piu' vicino
-        //                    (la meta' esatta va verso +inf: 50.5 -> 51,
-        //                     -50.5 -> -50; verificato con il compilatore)
-        //           AP_SAT    2 bit interi      ->  satura a 0x7FFFFFFF /
-        //                    0x80000000 invece di avvolgere
-        //
-        //     In VHDL:  resize(prodotto, 31, 0, fixed_saturate, fixed_round)
-        //
-        //     Questa riga NON e' gratis, ed e' il punto del gradino: e' un
-        //     sommatore (aggiunge mezzo LSB, cioe' 2^13, prima di scartare i
-        //     bit bassi) piu' un confronto sui bit alti e un mux a 32 bit che
-        //     sceglie fra valore, massimo e minimo. Da cercare nel report,
-        //     nelle voci Expression e Multiplexer.
-        //
-        //     Il caso che giustifica AP_SAT da solo: x = -2^31 e gain = -1.0.
-        //     Il prodotto esatto e' +2^31, che in 32 bit con segno non esiste.
-        //     Con AP_WRAP diventa -2^31: il segno sbagliato, in silenzio. Con
-        //     AP_SAT diventa +2^31-1: sbagliato di uno, e nel verso giusto.
-        //
-        out_t y = prodotto;
-
-        //  3) LA COPIA. out_t e ap_int<32> hanno gli stessi 32 bit con lo
-        //     stesso significato (nessuna parte frazionaria): questa
-        //     assegnazione non converte niente, e' un filo. I modi Q e O di
-        //     out_t hanno gia' agito nella riga precedente.
-        //
-        campione.data = y;
-
-        // --- SCRITTURA BLOCCANTE ---------------------------------------------
-        //
-        //  Scriviamo l'intera struct, quindi TKEEP, TSTRB e TLAST vengono
-        //  propagati automaticamente insieme al dato modificato. Per una IP
-        //  che deve stare in un sistema vero questo e' importante: se non
-        //  propagassi TLAST, il DMA a valle non chiuderebbe mai la trasferta.
-        //
+        // --- SCRITTURA BLOCCANTE: l'intera struct, TLAST/TKEEP propagati ---
         m_axis.write(campione);
 
-        // --- IL CONTEGGIO (la novita' del gradino) ----------------------------
+        // --- IL CONTEGGIO PER-PACCHETTO (INVARIATO dal 1.4) -----------------
         //
-        //  Una riga, e in hardware e' un sommatore a 32 bit con il suo
-        //  registro. Nota che incrementiamo DOPO aver scritto l'uscita, cosi'
-        //  il contatore conta i campioni effettivamente EMESSI e non quelli
-        //  letti: quando piu' avanti (gradino 1.9) aggiungeremo un caso in cui
-        //  un campione viene letto ma non emesso, questa distinzione smettera'
-        //  di essere accademica.
-        //
-        //  Il sommatore ha una dipendenza portata dal loop (conteggio dipende
-        //  da se stesso all'iterazione precedente). Vale la pena guardare nel
-        //  report se questo ha peggiorato l'II: un'addizione a 32 bit sta
-        //  comodamente in un ciclo, quindi non dovrebbe -- ma "non dovrebbe"
-        //  non e' una verifica, e il report ce lo dice.
+        //  Dopo la write, cosi' conta i campioni EMESSI (contera' al 1.9,
+        //  quando un campione potra' essere letto e non emesso).
         //
         conteggio++;
     }
 
     // -------------------------------------------------------------------------
-    //  LA SCRITTURA DEL REGISTRO DI STATO
+    //  GLI ACCUMULI: una volta per transazione, FUORI dal loop
     //
-    //  UNA riga, UNA volta, FUORI dal loop. La posizione non e' una questione
-    //  di eleganza: e' la specifica temporale del registro.
+    //  Due righe, e la posizione e' la loro specifica temporale, come per
+    //  sample_count al 1.4: l'assegnazione sta dove la funzione finisce,
+    //  quindi lo scheduler la mette nel ciclo di ap_done. Previsione: i due
+    //  registri static vengono caricati sotto la STESSA condizione
+    //  (ap_loop_exit_ready_pp0_iter2_reg and phi = 0) che oggi alza
+    //  sample_count_ap_vld e ap_done_int.
     //
-    //  In C sembra ovvio -- si assegna il risultato quando e' pronto. In
-    //  hardware quella singola assegnazione diventa:
+    //  In hardware sono un sommatore a 32 bit (tot_campioni + conteggio, con
+    //  conteggio a 31 bit esteso) e un incrementatore a 32 bit. Nessuno dei
+    //  due sta nel loop: non toccano l'II ne' la iteration latency.
     //
-    //        il datapath presenta il valore al banco registri e alza per UN
-    //        ciclo il segnale di validita'; il banco lo cattura.
+    //  PERCHE' FUORI E NON DENTRO (tot_campioni++ a ogni beat darebbe lo
+    //  stesso numero): dentro il loop sarebbe una dipendenza portata dal loop
+    //  su una static in una pipeline a II=1 -- un concetto in piu', quello
+    //  di min/max, che verra' dopo -- e il _ap_vld pulserebbe a ogni beat
+    //  (esperimento A del 1.4). Un gradino, una cosa.
     //
-    //  E lo fa nell'istante in cui la funzione finisce, cioe' lo stesso in cui
-    //  si alza ap_done. Da qui la regola d'uso, che e' anche il motivo per cui
-    //  un registro di stato si legge SOLO dopo aver visto ap_done:
-    //
-    //        scrivi gain -> ap_start -> aspetta ap_done -> leggi sample_count
-    //
-    //  Leggerlo prima non e' illegale (il bus risponde sempre): restituisce
-    //  semplicemente il valore della transazione PRECEDENTE, o zero se non ce
-    //  n'e' mai stata una. Ed e' esattamente il caso in cui serve il bit
-    //  _ap_vld di cui sopra.
-    //
-    //  Scriverla DENTRO il loop sarebbe C valido e darebbe lo stesso numero,
-    //  ma _ap_vld pulserebbe a ogni beat e smetterebbe di significare "il
-    //  risultato e' pronto". Verificato in scratchpad al gradino 1.4 (docs/00
-    //  par. 7, esperimento A): la ragione e' semantica, non di risorse.
+    //  += e ++ su unsigned: se avvolgono, avvolgono modulo 2^32, definito.
     // -------------------------------------------------------------------------
-    *sample_count = conteggio;
+    tot_campioni  += conteggio;
+    tot_pacchetti += 1;
+
+    // -------------------------------------------------------------------------
+    //  LE SCRITTURE DEI REGISTRI DI STATO (sample_count INVARIATO dal 1.4)
+    //
+    //  Tre righe, una per registro, tutte nello stesso ciclo: tre impulsi
+    //  _ap_vld contemporanei ad ap_done. sample_count resta per-pacchetto;
+    //  gli altri due sono la COPIA della static verso il banco registri. Sono
+    //  due registri per statistica: la static nel datapath, che accumula, e
+    //  int_total_samples nel banco, che il bus legge. Il banco non "vede" la
+    //  static, vede un valore e un impulso, come al 1.4.
+    // -------------------------------------------------------------------------
+    *sample_count  = conteggio;
+    *total_samples = tot_campioni;
+    *packet_count  = tot_pacchetti;
 }
 
 
@@ -369,27 +259,50 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
 // =============================================================================
 //
 //  Le previsioni, scritte PRIMA di sintetizzare (il confronto e' in docs/00
-//  par. 9):
+//  par. 10). Base: il build 1.6 congelato, 2 DSP / 336 FF / 394 LUT, 2,726 ns,
+//  II 1, iteration latency 4, 1 stato FSM, ADDR_BITS 5.
 //
-//  1) xaxis_scaler_hw.h: a 0x10 "bit 15~0 - gain[15:0]" invece di 31~0, e
-//     XAXIS_SCALER_CTRL_BITS_GAIN_DATA = 16. Gli offset NON si muovono.
+//  ESITO IN BREVE: le previsioni sulle static (3) e sul reset (6) sono
+//  esatte, ctrl_s_axi 172/264 esatto. Sbagliate: gli offset (16 byte per
+//  puntatore: 0x28 e 0x38), e la STRUTTURA -- la static fa estrarre il loop
+//  in un modulo a se' (axis_scaler_Pipeline_copia_pacchetto, con
+//  ap_start/ap_done/ap_idle/ap_ready come pin, i quattro del gradino 1.1) e
+//  il top diventa una FSM a 4 stati: 521 FF / 623 LUT, iteration latency 3,
+//  cosim N + 6. Il costo delle static in se' e' 64 FF / 66 LUT.
 //
-//  2) La entity top: identica. Nella entity del banco registri, gain passa
-//     da STD_LOGIC_VECTOR(31 downto 0) a (15 downto 0).
+//  1) xaxis_scaler_hw.h: 0x20 total_samples (Read) + 0x24 _ap_vld (Read/COR),
+//     0x28 packet_count + 0x2c. 0x10 e 0x18 fermi. BITS_..._DATA = 32.
 //
-//  3) Il report: DSP da 4 a 2. Il modulo del moltiplicatore cambia nome
-//     (era mul_32s_32s_32_2_1: 32 x 32 -> 32 bit; ora l'uscita deve avere i
-//     bit alti per la saturazione, quindi piu' larga). FF e LUT: piu' LUT
-//     per AP_RND e AP_SAT, meno FF perche' i registri di pipeline del
-//     prodotto sono piu' stretti. La iteration latency puo' crescere di uno
-//     o due cicli (sommatore e mux dopo il moltiplicatore); l'II resta 1.
+//  2) La entity top CAMBIA: C_S_AXI_CTRL_ADDR_WIDTH da 5 a 6 (ADDR_BITS 6 nel
+//     banco). Nessun pin nuovo. Nella entity del banco quattro porte "in":
+//     total_samples, total_samples_ap_vld, packet_count, packet_count_ap_vld.
 //
-//  4) Nel VHDL: cercare la costante 2^13 (16#2000#) del mezzo LSB, e il mux
-//     della saturazione con 0x7FFFFFFF e 0x80000000.
+//  3) Nel top: due registri a 32 BIT PIENI (unsigned: niente stretta a 31
+//     come conteggio), con := iniziale e SENZA ramo if (ap_rst_n_inv = '1')
+//     (siamo in reset=control). Caricati sotto la stessa condizione di
+//     sample_count_ap_vld. NESSUN mux nuovo nella tabella Multiplexer: i due
+//     mux a 31 bit di conteggio restano, e sono di ap_loop_init, non del
+//     reset.
 //
-//  5) Il vecchio testbench (gradino 1.5) fatto girare contro questo sorgente
-//     deve FALLIRE: passava gain interi (2, -3, 100000000) che ora vengono
-//     convertiti in Q2.14 avvolgendo, e il caso "gain enorme" documentava il
-//     troncamento che abbiamo appena eliminato. Un test vecchio che fallisce
-//     su un comportamento nuovo e' la prova che stava verificando qualcosa.
+//  4) Il report:  DSP 2, II 1, iter. latency 4, 1 stato, Estimated 2,726 ns
+//     (percorso critico ancora nel moltiplicatore). Instance ctrl_s_axi
+//     ~172 FF / ~264 LUT (+38/+64 per registro di stato, misurato al 1.4,
+//     x2). Register ~304 FF (+64). Expression ~240 LUT (un + e un ++ a 32).
+//     Multiplexer ~70. Totale ~476 FF / ~590 LUT. Stessi 5 file VHDL.
+//
+//  5) Cosim: N + 4 per transazione, invariata. Se e' N + 5, le somme dopo il
+//     loop hanno preso un ciclo in piu': da annotare, non da nascondere.
+//
+//  6) L'esperimento reset (tre cartelle in scratchpad, stesso sorgente):
+//       control  nessun ramo di reset sulle static
+//       state    ramo di reset SOLO sulle due static; tutto il resto identico
+//                a control, mux di conteggio compresi (=> la spiegazione di
+//                docs/00 par. 7 sui mux era sbagliata e va corretta)
+//       all      ramo di reset anche sui registri di pipeline del datapath
+//     ctrl_s_axi.vhd identico nelle tre; LUT circa uguali (il reset sincrono
+//     finisce sul pin SR del flip-flop, non in logica).
+//
+//  7) Testbench: il tb del 1.6 contro questo DUT NON COMPILA (4 argomenti
+//     contro 6). Il mutante senza static (variabili locali) deve fallire
+//     dalla SECONDA chiamata in poi, non dalla prima.
 // =============================================================================

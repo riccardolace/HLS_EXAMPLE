@@ -229,6 +229,10 @@ interno, perché la leggo e la scrivo ma non l'ho dichiarata persistente.
 È la regola del gradino 1.4 vista dall'altro lato: **`static` = stato che vive
 dentro il chip; argomento = filo che esce.**
 
+Com'è fatto quel registro nell'RTL, chi lo azzera nelle tre modalità di
+`syn.rtl.reset`, e l'effetto collaterale che una `static` ha sulla struttura
+del top (il loop estratto in un modulo a sé): gradino 1.7, `docs/00` §10.
+
 ### 4d. Quando HLS è scomodo per una FSM
 
 Per una FSM piccola con tutto combinatorio in un ciclo, HLS è genuinamente

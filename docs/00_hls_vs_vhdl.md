@@ -1360,9 +1360,13 @@ Register               103 FF /  10 LUT   140 /  12    +37 FF /  +2 LUT
   `syn.rtl.reset=control`: il reset globale tocca solo i registri di controllo.
   L'azzeramento deve quindi passare dal datapath, e passa da un mux.
 
-  È una osservazione, non ancora una conclusione: al **gradino 1.7** faremo
-  l'esperimento vero, `reset=control` contro `reset=state`, con il diff del
-  VHDL sotto gli occhi.
+  **Corretto al gradino 1.7 (§10): questa spiegazione era sbagliata.** Con
+  `reset=all` il contatore prende il suo ramo di reset e i due mux restano
+  identici, 70 LUT. Sono governati da `ap_loop_init`, cioè "prima iterazione
+  della transazione": l'azzeramento di un locale è *per `ap_start`*, non per
+  reset, e nessuna modalità di reset può assorbirlo. Il mux è il prezzo di
+  `int conteggio = 0` in una funzione che viene chiamata più volte, e in VHDL
+  sarebbe un `elsif ap_start = '1' then conteggio <= 0;` — un mux anche a mano.
 
 Una curiosità del report, per non restarci male guardandolo: nella tabella
 *Interface* la colonna `C Type` delle righe `s_axi_ctrl_*` è passata da
@@ -1941,3 +1945,377 @@ sa che *saprebbe* fallire:
   gain = 1,99994 il troncamento dà 199 dove serve 200 su *ogni* campione
   positivo — è il bias sistematico verso il basso di `AP_TRN`, la ragione
   statistica per cui `AP_RND` esiste.
+
+---
+
+## 10. Cosa abbiamo osservato al gradino 1.7
+
+Modifica: **due `static`, due somme dopo il loop, due puntatori in fondo alla
+firma**.
+
+```diff
+  void axis_scaler(hls::stream<pkt_t> &s_axis,
+                   hls::stream<pkt_t> &m_axis,
+                   gain_t              gain,
+-                  int                *sample_count);
++                  int                *sample_count,
++                  unsigned int       *total_samples,
++                  unsigned int       *packet_count);
+
++ #pragma HLS INTERFACE mode=s_axilite port=total_samples bundle=ctrl
++ #pragma HLS INTERFACE mode=s_axilite port=packet_count  bundle=ctrl
+
++ static unsigned int tot_campioni  = 0;
++ static unsigned int tot_pacchetti = 0;
+  int conteggio = 0;
+  copia_pacchetto:
+  while (!ultimo) { ... }
++ tot_campioni  += conteggio;
++ tot_pacchetti += 1;
+  *sample_count  = conteggio;
++ *total_samples = tot_campioni;
++ *packet_count  = tot_pacchetti;
+```
+
+È il gradino in cui la IP acquista **memoria**: fino al 1.6 ogni `ap_start`
+ripartiva da zero. E il tool lo ha annunciato da solo, nel log di sintesi, con
+un avviso che non avevamo mai visto:
+
+```text
+WARNING: [RTGEN 206-101] Register 'tot_campioni' is power-on initialization.
+WARNING: [RTGEN 206-101] Register 'tot_pacchetti' is power-on initialization.
+```
+
+*Power-on initialization*: questo registro ha un valore di accensione, non un
+reset. È la frase che riassume tutto il gradino, e ci torniamo.
+
+### Previsioni contro misure
+
+| Previsione (nel `.cpp`, prima della sintesi) | Misura |
+|---|---|
+| `_hw.h`: `total_samples` a 0x20/0x24, `packet_count` a 0x28/0x2c | ✗ **0x28/0x2c e 0x38/0x3c**: due buchi di 8 byte (vedi sotto) |
+| entity top: `C_S_AXI_CTRL_ADDR_WIDTH` 5 → 6, nessun pin nuovo | ✓ (e 0x3c sta ancora in 6 bit) |
+| banco registri: quattro porte `in` nuove, `int_*` azzerati da `ARESET` | ✓ esatto, stesso idioma del 1.4 |
+| due registri a **32 bit pieni** (`unsigned`), con `:=` e senza ramo di reset | ✓ `tot_campioni`, `tot_pacchetti`: 32 FF, nessun `ap_rst_n_inv` |
+| nessun mux nuovo | ✓ tabella *Multiplexer* senza voci `tot_*` |
+| i due mux a 31 bit di `conteggio` restano, e sono di `ap_loop_init` | ✓ identici (70 LUT), in tutte e tre le modalità di reset |
+| caricati nella stessa condizione di `sample_count_ap_vld` | ✓ nello stesso ciclo — ma la condizione non è più quella |
+| DSP 2, II 1, Estimated 2,726 ns | ✓ |
+| iteration latency 4, 1 stato FSM, gli stessi 5 file VHDL | ✗ **3, 4 + 1 stati, 6 file**: la struttura è cambiata |
+| `ctrl_s_axi` ~172 FF / ~264 LUT | ✓ **esatto**: +38/+64 per registro di stato, come al 1.4 |
+| totale ~476 FF / ~590 LUT | ✗ **521 / 623** |
+| cosim N + 4 | ✗ **N + 6** |
+| reset: `state` tocca solo le due `static`, `all` anche il datapath, mux invariati | ✓ esatto (vedi la sezione dedicata) |
+
+Le previsioni sulle `static` in sé sono tutte giuste. Quelle sbagliate sono
+di due tipi diversi, e vale la pena separarle: una regola dell'allocatore di
+indirizzi che non conoscevamo, e una **ristrutturazione dell'RTL** che la
+`static` ha innescato senza che niente nel sorgente lo facesse sospettare.
+
+### Il buco nella mappa registri: 16 byte per ogni puntatore
+
+```text
+// 0x18 : Data signal of sample_count
+// 0x1c : Control signal of sample_count
+// 0x28 : Data signal of total_samples        <- non 0x20
+// 0x2c : Control signal of total_samples
+// 0x38 : Data signal of packet_count         <- non 0x30
+// 0x3c : Control signal of packet_count
+```
+
+0x20–0x24 e 0x30–0x34 non sono documentati e non esistono nel VHDL: il decoder
+non li conosce. Per capire da cosa dipende, tre varianti in scratchpad:
+
+| Variante | Offset dei registri nuovi |
+|---|---|
+| i due argomenti come `int *` invece di `unsigned int *` | 0x28, 0x38 — identici |
+| sorgente del 1.6 + un terzo puntatore `int *dummy`, scritto con un locale, **senza `static`** | **0x28** |
+| una sola `static` | 0x28, 0x38 — identici |
+
+Quindi non c'entrano né `static` né `unsigned`: è l'allocatore. **Ogni
+argomento puntatore riserva 16 byte** — data, control, e altri 8 byte che
+servirebbero se il puntatore fosse anche *letto* dalla funzione (in quel caso
+HLS genera due porte, `nome_i` e `nome_o`, e servono due registri; `docs/05`
+§4c). Il blocco di `sample_count` è 0x18–0x27; al 1.4 se ne vedeva solo la
+metà usata perché nulla veniva dopo, e la larghezza dell'indirizzo è calcolata
+sull'ultimo registro *usato* (0x1c → 5 bit), non sul blocco riservato.
+
+Per il driver non cambia niente — legge gli offset da `_hw.h`, mai a mano — ma
+per la scheda tecnica sì: sette registri di stato a 16 byte l'uno occupano più
+spazio di quanto sembri, e la mappa avrà buchi.
+
+### La ristrutturazione: il loop è diventato un blocco dentro il blocco
+
+È la sorpresa vera. `ls syn/vhdl/`:
+
+```diff
++ axis_scaler_axis_scaler_Pipeline_copia_pacchetto.vhd      <- nuovo: il loop
+  axis_scaler_ctrl_s_axi.vhd
+- axis_scaler_flow_control_loop_pipe.vhd
++ axis_scaler_flow_control_loop_pipe_sequential_init.vhd
+  axis_scaler_mul_32s_16s_48_1_1.vhd
+  axis_scaler_regslice_both.vhd
+  axis_scaler.vhd
+```
+
+Il loop `copia_pacchetto` non sta più nel top: è stato **estratto in un modulo
+suo**, e la sua entity dice tutto da sola:
+
+```vhdl
+entity axis_scaler_axis_scaler_Pipeline_copia_pacchetto is
+port (
+    ap_clk, ap_rst : IN STD_LOGIC;
+    ap_start : IN  STD_LOGIC;          -- i quattro pin del gradino 1.1,
+    ap_done  : OUT STD_LOGIC;          -- tornati fisici: e' un blocco
+    ap_idle  : OUT STD_LOGIC;          -- ap_ctrl_hs dentro il blocco
+    ap_ready : OUT STD_LOGIC;
+    s_axis_* / m_axis_*                -- gli stream passano da qui
+    sext_ln199 : IN  STD_LOGIC_VECTOR (15 downto 0);   -- gain, gia' letto
+    conteggio_out : OUT STD_LOGIC_VECTOR (30 downto 0);
+    conteggio_out_ap_vld : OUT STD_LOGIC );            -- il conteggio, con il suo valido
+end;
+```
+
+Sono i quattro pin di handshake che al 1.2 avevamo visto sparire dentro
+`s_axi_ctrl`. Qui ricompaiono, un livello sotto: il top li pilota come farebbe
+un processore, e il loop è una "funzione" hardware con il suo protocollo. Anche
+`conteggio` esce con un `_ap_vld`, come un registro di stato: il pattern del 1.4
+applicato fra due moduli invece che fra modulo e bus.
+
+E il top, che al 1.6 aveva **un solo stato** (la pipeline), ora è un
+sequenziatore a **quattro**:
+
+```vhdl
+constant ap_ST_fsm_state1 : ... := "0001";   -- aspetta ap_start
+constant ap_ST_fsm_state2 : ... := "0010";   -- legge gain, lancia il loop (ap_start del sotto-modulo)
+constant ap_ST_fsm_state3 : ... := "0100";   -- il loop gira: TREADY passa dal sotto-modulo
+constant ap_ST_fsm_state4 : ... := "1000";   -- UN ciclo: accumula, alza i tre _ap_vld e ap_done
+```
+
+Lo stato 4 è dove vivono le `static`:
+
+```vhdl
+process (ap_clk)
+begin
+    if (ap_clk'event and ap_clk = '1') then
+        if (((ap_const_logic_1 = ap_CS_fsm_state4) and (regslice_both_m_axis_V_data_V_U_apdone_blk = ap_const_logic_0))) then
+            tot_campioni  <= add_ln236_fu_144_p2;      -- tot_campioni + zext(conteggio_out)
+            tot_pacchetti <= add_ln237_fu_161_p2;      -- tot_pacchetti + 1
+        end if;
+    end if;
+end process;
+
+total_samples <= std_logic_vector(unsigned(tot_campioni) + unsigned(zext_ln165_fu_135_p1));
+packet_count  <= std_logic_vector(unsigned(tot_pacchetti) + unsigned(ap_const_lv32_1));
+```
+
+Tre cose da leggere qui.
+
+**a) Nessun `ap_rst_n_inv`, nessun `ap_loop_init`, nessun mux.** Il processo
+è un registro con enable e basta — la forma più semplice che un registro può
+avere. Confronta con `conteggio_fu_90` nel modulo del loop, che ha ancora i suoi
+due mux a 31 bit e il ramo `elsif (ap_loop_init = '1') then <= 0`. La
+differenza fra locale e `static` nell'RTL è *tutta* lì: il locale ha un valore
+iniziale **per transazione**, e qualcuno deve caricarglielo; la `static` no.
+
+**b) La porta verso il banco è cablata all'uscita del sommatore**, non al
+registro. Nello stato 4 il banco riceve `tot + n` nello stesso ciclo in cui il
+registro lo cattura: il valore in 0x28 è quello *dopo* l'accumulo, senza un
+ciclo di ritardo. Al 1.4 `sample_count` era cablato al registro `conteggio`,
+perché lì il valore era già pronto.
+
+**c) Il valore iniziale è nel `:=`**, e solo lì:
+
+```vhdl
+signal tot_campioni : STD_LOGIC_VECTOR (31 downto 0) := "00000000000000000000000000000000";
+```
+
+Nel FPGA quel `:=` diventa l'attributo `INIT` del flip-flop: il valore che
+il bitstream carica alla **configurazione**. Non c'entra `ap_rst_n`. Da qui
+l'avviso `206-101`: il tool ci sta dicendo "questo registro parte da zero
+quando accendi il chip, e poi non lo azzero più io".
+
+**Perché la struttura è cambiata.** Isolato con altre due varianti: con una
+sola `static` succede lo stesso; leggere la `static` in un locale prima del
+loop e riscriverla dopo non cambia un byte. Invece il sorgente del 1.6 con un
+sommatore dopo il loop ma **senza** `static` (`*dummy = conteggio + 1`) resta un
+modulo solo, un solo stato, iteration latency 4. È quindi la `static` in sé:
+fino al 1.6 la funzione *era* il loop, e il tool poteva fondere le tre righe
+prima e dopo dentro il prologo e l'epilogo della pipeline. Un registro che
+sopravvive alla funzione e viene aggiornato *dopo* il loop dà al top un pezzo
+di stato proprio, e il tool separa: pipeline da una parte, sequenziatore
+dall'altra. Il log non lo dice; il VHDL sì.
+
+**Cosa costa.** La cosim lo misura: **N + 6** cicli per transazione invece di
+N + 4. Due cicli in più, e sono esattamente lo stato 2 (un ciclo per lanciare il
+sotto-modulo) e lo stato 4 (un ciclo per accumulare). L'*iteration latency* del
+loop è scesa da 4 a 3 (`Depth = 3` nel log): il report non dice quale stadio è
+sparito — lo *Schedule Viewer* della GUI sì, ed è lì che va guardato — e non
+inventiamo una spiegazione. In ogni caso i due cicli di sequenziamento pesano
+di più del ciclo guadagnato. Per un pacchetto da 1000 campioni è lo 0,2 %;
+per pacchetti da 8 è il 15 %. Con `random_stall` in Fase 3 vedremo se il
+`regslice` in mezzo ai due moduli aggiunge altro.
+
+### Il costo, voce per voce
+
+| | DSP | FF | LUT | II | Iter. lat. | Stati | Estimated | cosim |
+|---|---|---|---|---|---|---|---|---|
+| 1.6 | 2 | 336 | 394 | 1 | 4 | 1 | 2,726 ns | N + 4 |
+| 1.7 | 2 | **521** | **623** | 1 | **3** | **4 + 1** | 2,726 ns | **N + 6** |
+
+Dove sono finiti +185 FF e +229 LUT, in due tabelle perché ora i moduli sono
+due:
+
+```text
+                                1.6 (un modulo)     1.7 top     1.7 loop      note
+ctrl_s_axi                     96 FF / 136 LUT   172 / 264        -         +76 / +128: PREVISTO ESATTO (2 x 38/64)
+Register                      240 FF             126 FF        223 FF       vedi sotto
+Expression                    176 LUT             66 LUT       170 LUT      +60: i due sommatori a 32 bit
+Multiplexer                    70 LUT             53 LUT        70 LUT      +53: NUOVI, dalla ristrutturazione
+```
+
+- **Le due `static`: 64 FF, 66 LUT** (`add_ln236` a 32 bit con due operandi
+  variabili, `add_ln237` con una costante). È il costo *previsto* del gradino,
+  ed è tutto qui.
+- **La ristrutturazione: ~109 FF e ~53 LUT** che non abbiamo chiesto. Nel top
+  compaiono `m_axis_TDATA/TKEEP/TSTRB/TLAST_reg` (41 FF) e i relativi mux (53
+  LUT): il sotto-modulo produce lo stream, il top lo ri-registra prima del
+  `regslice` d'uscita. Più `gain_read_reg_180` (16 FF) e la FSM (4 FF). Il modulo
+  del loop, da solo, ha 223 FF contro i 240 di *Register* del 1.6: il loop in
+  sé non è cresciuto.
+- Il `mul_32s_16s_48_1_1` e il `regslice_both` sono **identici byte per byte**
+  al 1.6. `flow_control_loop_pipe` è diventato `_sequential_init`: stessa
+  logica, più `ap_done_cache` e `ap_loop_init_int` per un loop lanciato da una
+  FSM esterna invece che dall'`ap_start` del blocco.
+
+Il timing non si muove: 2,726 ns in tutte le varianti, il percorso critico è
+ancora dentro il moltiplicatore.
+
+### `reset`: tre modalità, e cosa vuol dire ognuna per un registro
+
+Tre cartelle in scratchpad, **stesso sorgente**, `hls_config.cfg` che
+differisce per la riga `syn.rtl.reset=`. FF/LUT/timing: **identici** nelle
+tre (521 / 623 / 2,726 ns) — il reset sincrono finisce sul pin `SR` del
+flip-flop, non in logica. Quello che cambia è *quali* processi hanno il ramo
+`if (ap_rst_n_inv = '1')`:
+
+| | `control` (il nostro) | `state` | `all` |
+|---|---|---|---|
+| rami di reset nel top | 2 | **4** | 9 |
+| rami di reset nel modulo del loop | 6 | 6 | **24** |
+| `ctrl_s_axi`, `mul`, `regslice`, `flow_control` | — | identici | identici |
+| `WARNING 206-101 power-on initialization` | 2 | **0** | 0 |
+| i due mux a 31 bit di `conteggio` | 70 LUT | 70 LUT | 70 LUT |
+
+Il diff `control → state` è **solo** questo, 37 righe, tutte qui:
+
+```diff
+-    process (ap_clk)
+-    begin
+-        if (ap_clk'event and ap_clk = '1') then
+-            if ((... ap_CS_fsm_state4 ...)) then
+-                tot_campioni  <= add_ln236_fu_144_p2;
+-                tot_pacchetti <= add_ln237_fu_161_p2;
++    tot_campioni_assign_proc : process(ap_clk)
++    begin
++        if (ap_clk'event and ap_clk =  '1') then
++            if (ap_rst_n_inv = '1') then
++                tot_campioni <= ap_const_lv32_0;
++            else
++                if ((... ap_CS_fsm_state4 ...)) then
++                    tot_campioni <= add_ln236_fu_144_p2;
+```
+
+Il diff `control → all` aggiunge il ramo anche a `gain_read_reg`,
+`m_axis_*_reg` nel top, e nel modulo del loop a `conteggio_fu_90`,
+`p_s_reg` (il campione), `prodotto_reg`, `sext_*`, `y_reg`, `tmp_*`, `ultimo_reg`
+e ai registri di pipeline del predicato — 24 in tutto.
+
+Detto nel modo più semplice possibile, pensando a **cosa succede quando
+`ap_rst_n` va basso a metà vita del chip**:
+
+| Modalità | Cosa torna a zero | Cosa NON torna a zero | Quando ha senso |
+|---|---|---|---|
+| `control` | la FSM, i segnali di handshake (`ap_done`, `ap_start` interni), il banco registri intero | le `static` e tutti i registri di dato | il default: un reset rimette la IP in ascolto, i dati vecchi verranno sovrascritti dalla transazione successiva. **Ma le `static` continuano ad accumulare** |
+| `state` | come `control`, **più le `static`** | i registri di pipeline del datapath (`prodotto_reg`, `y_reg`…) | quando la IP ha statistiche o stato persistente e "reset" deve voler dire "ricomincia da zero" — cioè da questo gradino in poi |
+| `all` | tutto | niente | quando vuoi che ogni flip-flop abbia un valore noto dopo il reset (verifica formale, X-propagation in simulazione, sicurezza funzionale). Costa rami di reset su registri che verrebbero comunque sovrascritti |
+
+Il nome della modalità dice *di quali variabili C* si occupa: `control` =
+solo il controllo, `state` = anche lo *stato* del programma (le `static` e le
+globali, cioè quello che sopravvive a una chiamata), `all` = anche i
+temporanei. È la stessa distinzione che in VHDL faresti a mano scegliendo cosa
+mettere nel ramo `if rst = '1'`: i contatori sì, i registri di pipeline dei
+dati di solito no, perché un reset sui dati costa fan-out sul segnale di reset
+e non serve.
+
+**Con `control`, l'incoerenza prevista è reale.** Nel banco registri
+`int_total_samples` **è** azzerato da `ARESET` (l'idioma del 1.4, riga per riga
+identico); la `static` nel datapath no. Dopo un reset a metà vita, il software
+legge 0 a 0x28, poi manda un pacchetto da *n* campioni e legge
+`vecchio_totale + n`. Il registro "torna a zero e poi salta". Non è un bug del
+tool: è la definizione di `control`, e la risposta è `state` (in hardware)
+oppure un `CLEAR_STATS` in software (gradino 1.8). Quale dei due per questa
+IP, lo decidiamo al 1.8 con il flag sotto mano; intanto il cfg resta
+`control`, così la differenza continua a essere visibile nel build.
+
+### La domanda del §7, chiusa
+
+Al gradino 1.4 avevamo scritto che i due mux a 31 bit di `conteggio`
+esistono *«perché `conteggio` è un registro di dato e con `reset=control` il
+reset globale tocca solo i registri di controllo: l'azzeramento deve passare
+dal datapath»*. Era un'ipotesi, e **era sbagliata**. Con `reset=all`,
+`conteggio_fu_90` prende il suo bel ramo `if (ap_rst = '1') then <= 0` — e i
+due mux restano, 70 LUT identici. Perché l'azzeramento di un locale è **per
+transazione**, non per reset: `int conteggio = 0` vuol dire "ogni volta che la
+funzione parte", e nessun `ap_rst_n` può fare quel lavoro, in nessuna
+modalità. In VHDL è la differenza fra
+
+```vhdl
+if rst = '1' then conteggio <= 0;            -- una volta, al reset
+elsif ap_start = '1' then conteggio <= 0;    -- a ogni transazione: questo e' il mux
+```
+
+e il secondo `elsif` costa un mux anche a mano. Il §7 è stato corretto con un
+rimando qui.
+
+### Il testbench: verificare la memoria
+
+Tre cose nuove.
+
+**1) L'atteso è una strada indipendente, e parte dal primo caso.** Due
+contatori globali del testbench, `atteso_tot_campioni` e
+`atteso_tot_pacchetti`, aggiornati a ogni `prova_pacchetto` con
+`golden_conteggio(stimoli)` — mai con il `sample_count` che riporta il DUT. Se
+il DUT sbagliasse `sample_count` e `total_samples` nello stesso modo, un atteso
+costruito sul primo non lo vedrebbe. E partono dal primo caso di `main()`,
+perché le `static` del DUT accumulano da sempre: quando si arriva al caso
+"3 poi 5" i totali valgono già 89 campioni e 12 pacchetti, e il test lo
+stampa.
+
+**2) Il caso del gradino, locale contro `static` fianco a fianco:**
+
+```text
+--- 3 campioni (sample_count 3; total_samples +3; packet_count +1) ---
+  OK: ... sample_count = 3, total_samples = 92, packet_count = 13
+--- 5 campioni (sample_count 5, non 8; total_samples +5; packet_count +1) ---
+  OK: ... sample_count = 5, total_samples = 97, packet_count = 14
+```
+
+**3) La cosim verifica la persistenza sull'RTL**, non solo in C: le 14
+transazioni girano su una sola istanza, e i totali 97/14 tornano identici. Quello
+che la cosim *non* può mostrare è il reset a metà corsa: si legge nel VHDL, e
+in Fase 3 lo vedremo in waveform.
+
+**Le verifiche del testbench stesso:**
+
+- **mutante senza `static`** (le due variabili locali): **26 errori** = 13
+  casi × 2 registri, tutti **dalla seconda chiamata in poi**. La prima (1
+  campione, 1 pacchetto) passa anche senza `static`, com'era previsto: un test
+  con un solo pacchetto non distingue un accumulatore da un locale;
+- **mutante con `tot_pacchetti++` dentro il loop**: 13 errori, `packet_count`
+  conta i beat (9, 26, 34…) — la posizione della riga è la sua specifica;
+- **il testbench del 1.6 contro questo DUT non compila**: `error: too few
+  arguments`. Il fallimento è a compile-time, non semantico, e vale la
+  simmetria: un *driver* scritto per il 1.6 funzionerebbe ancora, perché 0x10 e
+  0x18 non si sono mossi. **La firma C si rompe, la mappa registri no** — è
+  l'append-only visto dai due lati.

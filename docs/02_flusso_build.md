@@ -203,6 +203,20 @@ I sotto-moduli (`_ctrl_s_axi`, `_mul_*`, `_regslice_*`) non hanno questo
 problema e si confrontano con `diff` o `cmp` direttamente. Nella GUI, *Compare
 With* non normalizza: leggi il diff sapendo che `lnNNN` non è una differenza.
 
+**Quando compare un file nuovo in `syn/vhdl/`, i report si sdoppiano.** Al
+gradino 1.7 il loop è stato estratto in un modulo a sé, e da allora
+`syn/report/` contiene un `axis_scaler_<Modulo>_csynth.rpt` per ogni modulo
+oltre al report del top: le tabelle *Register*, *Expression* e *Multiplexer* del
+top contano solo la logica del top, e quella del sotto-modulo compare nel top
+come una riga di *Instance*. Per il confronto con il gradino precedente vanno
+sommate. Nella GUI: *Reports → Synthesis* ha un menu a tendina con i moduli.
+
+**Il log dice cose che il report non dice.** I `WARNING` di
+`workspace/axis_scaler/axis_scaler/logs/hls_compile.log` (nella GUI: pannello
+*Output*, oppure il file in *Explorer*) vanno letti a ogni sintesi: al 1.7 il
+fatto centrale del gradino — *«Register 'tot_campioni' is power-on
+initialization»* — stava lì e in nessun report.
+
 ### Una asimmetria utile da conoscere
 
 Con `flow_target=vivado`, **`make csynth` esegue anche il packaging dell'IP**. Nel
