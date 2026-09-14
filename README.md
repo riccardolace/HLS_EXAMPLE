@@ -5,7 +5,7 @@ dati **AXI4-Stream** e banco registri **AXI4-Lite** (configurazione, stato,
 controllo, interrupt), fino a farla entrare nel catalogo IP di Vivado come una
 IP AMD.
 
-**Stato attuale: gradino 1.4 — primo registro di stato.**
+**Stato attuale: gradino 1.5 — controllo esplicito del pipeline.**
 
 ---
 
@@ -68,7 +68,7 @@ cambiato nell'hardware generato.
 | 1.2 | `s_axilite` su `return` | Quei pin lasciano il bordo del modulo: nascono `s_axi_ctrl` + `interrupt`, e i registri CTRL/GIER/IER/ISR | ✅ fatto |
 | 1.3 | Primo registro di configurazione | L'ordine degli argomenti C **è** la mappa registri. Nasce `gain` a 0x10, e il primo moltiplicatore | ✅ fatto |
 | 1.4 | Primo registro di stato | Un output è un puntatore perché il C lo dice. Nasce `sample_count` a 0x18 e il bit `_ap_vld` a 0x1c, nello slot che al 1.3 era `reserved` | ✅ fatto |
-| 1.5 | Controllo esplicito del pipeline | Che `PIPELINE II=1` non cambia niente (lo fa già il tool), e cosa si compra forzando `II=2` | — |
+| 1.5 | Controllo esplicito del pipeline | Che `PIPELINE II=1` non cambia un filo (lo faceva già il tool), cosa sono davvero II e iteration latency, e che forzare `II=2`/`4` qui non compra un DSP: `TREADY` un ciclo sì e uno no, e la sola cosa che sparisce sono i registri dei campioni in volo | ✅ fatto |
 | 1.6 | `ap_fixed` per il guadagno | Fixed point, crescita dei bit, saturazione | — |
 | 1.7 | Statistiche in variabili `static` | Registri che sopravvivono, e il reset | — |
 | 1.8 | Registri a campi di bit, flag sticky | Come si scrive un registro industriale | — |

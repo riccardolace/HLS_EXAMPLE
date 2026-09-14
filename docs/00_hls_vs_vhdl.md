@@ -1424,3 +1424,272 @@ esistono 0x18 e 0x1c, non esiste `_ap_vld`, e `sample_count` è un puntatore a
 una variabile dello stack. Che quel puntatore diventi un registro a 0x18 con un
 bit di validità a 0x1c lo verificheranno la cosimulation (Fase 3) e la
 simulazione del block design con gli AXI VIP (Fase 5).
+
+### Aggiunta: la cosimulation del 1.4
+
+La cosim è stata poi lanciata dalla GUI (*C/RTL COSIMULATION → Run*; il journal
+registra `comp.run(operation="CO_SIMULATION")`), e ha chiuso il limite appena
+descritto: **Pass**, nove transazioni per i nove casi del testbench, quindi
+`sample_count` e il suo `_ap_vld` sono stati verificati sull'RTL in esecuzione.
+
+```text
+                    latency     interval          campioni
+transaction 0:            5           16              1
+transaction 1:           12           23              8
+transaction 2:           21           35             17
+```
+
+Confronto con il 1.1 (§4), dove le stesse tre transazioni costavano 2, 10 e 18
+cicli: ora costano **N + 4** tutte e tre. I quattro cicli in più sono l'*iteration
+latency* del loop — cioè gli stadi del moltiplicatore arrivato al 1.3 — pagati
+una volta sola per pacchetto, all'inizio. È il costo di riempire la catena di
+montaggio, e resta uguale per un pacchetto di 1 o di 1000 campioni. La bolla del
+1.1 (8→10 invece di 9) qui non c'è più; resta senza spiegazione fino alla
+Fase 3, quando guarderemo le waveform.
+
+---
+
+## 8. Cosa abbiamo osservato al gradino 1.5
+
+Modifica: **una riga**, dentro il corpo del loop.
+
+```diff
+  copia_pacchetto:
+  while (!ultimo) {
++ #pragma HLS PIPELINE II=1
+      pkt_t campione = s_axis.read();
+```
+
+È il primo gradino in cui la riga aggiunta **non fa comparire niente**
+nell'hardware. Lo sapevamo dal 1.1 — il tool pipelina i loop da solo — e
+questo gradino serve a *verificarlo*, e poi a usare la stessa riga per forzare
+un ritmo diverso e vedere cosa succede davvero ai fili.
+
+Prima la sintassi, perché è la cosa che sorprende venendo dal VHDL: il pragma
+sta **dentro** il loop, non prima dell'etichetta. Si applica al loop che lo
+contiene. Nella GUI: pannello *HLS DIRECTIVES*, cursore sul loop, `+` →
+`PIPELINE` → `II=1`; la destinazione *Source file* scrive questa riga nel
+`.cpp`, la destinazione *Config file* scrive invece in `hls_config.cfg`
+
+```ini
+syn.directive.pipeline=axis_scaler/copia_pacchetto II=1
+```
+
+che è la forma usata per tutti gli esperimenti di questa sezione.
+
+### Verificato: non cambia niente. E la verifica ha insegnato due cose
+
+Il metodo è quello di sempre: build del 1.4 congelato prima di risintetizzare,
+poi diff. Il risultato, in ordine:
+
+| Cosa | Esito |
+|---|---|
+| `axis_scaler_ctrl_s_axi.vhd`, `_mul_32s_32s_32_2_1.vhd`, `_regslice_both.vhd`, `_flow_control_loop_pipe.vhd` | **identici byte per byte** |
+| `xaxis_scaler_hw.h` | identico |
+| report: 4 DSP, 298 FF, 343 LUT, 2,238 ns, II 1, iteration latency 4, un solo stato FSM | identico |
+| cosim: tabella delle transazioni (`result.transaction.rpt`) | **identica ciclo per ciclo** al 1.4 |
+| `axis_scaler.vhd` (il top) | 86 righe di diff — ma vedi sotto |
+
+**Prima cosa imparata.** Il top *sembrava* diverso. Tutte le differenze erano di
+questo tipo:
+
+```diff
+- signal phi_ln203_reg_123 : STD_LOGIC_VECTOR (0 downto 0);
++ signal phi_ln159_reg_123 : STD_LOGIC_VECTOR (0 downto 0);
+```
+
+HLS incorpora **il numero di riga del sorgente** nei nomi dei segnali
+(`ln203` = riga 203). Riscrivendo i commenti del 1.4 il `while` è salito dalla
+riga 203 alla 159, e 43 righe del VHDL hanno cambiato nome senza che cambiasse
+un solo filo. Normalizzando (`sed -E 's/ln[0-9]+/lnX/g'` su entrambi i file) il
+diff è **vuoto**. Da oggi il confronto fra gradini si fa così — è in `docs/02` §7.
+
+**Seconda cosa.** L'unica traccia strutturale della modifica sta in una cartella,
+non in un file: `syn/inferred_directives.ini` **non viene più generato**. Al 1.4
+conteneva
+
+```ini
+# Inferred from syn.compile.pipeline_loops=64
+syn.directive.pipeline=axis_scaler/copia_pacchetto
+```
+
+cioè la confessione del tool: *questo loop l'ho pipelinato io, per un default*.
+Ora che lo dichiariamo noi non c'è più niente di dedotto, e il file sparisce.
+Anche la colonna `target` del report, che si poteva pensare cambiasse, era già
+`1` al 1.4: default e pragma chiedono la stessa cosa. (Nel log invece la
+differenza c'è: `Target II = NA` prima, `Target II = 1` adesso.)
+
+### I due numeri, e come si vedono nei fili
+
+Dal report, che è lo stesso dal gradino 1.3:
+
+```text
+|- copia_pacchetto  |  Iteration Latency 4  |  II achieved 1  |  target 1  |  Pipelined yes |
+```
+
+- **Iteration latency = 4**: quanti cicli impiega *un* campione ad attraversare
+  il corpo del loop. Il moltiplicatore 32×32 non sta in 4 ns e il tool lo ha
+  spezzato in stadi; è la profondità della catena di montaggio, e la cosim la
+  misura come i "+4" della sezione precedente.
+- **II = 1** (*initiation interval*): ogni quanti cicli *può entrare* un
+  campione nuovo. Non aspetta che il precedente sia uscito: fino a quattro
+  campioni sono "in volo" insieme, uno per stadio.
+
+Nel VHDL l'II=1 è esattamente questo: la pipeline ha **un solo stato** e
+`TREADY` può essere alto in ogni ciclo in cui quello stato è attivo e niente
+blocca:
+
+```vhdl
+constant ap_ST_fsm_pp0_stage0 : STD_LOGIC_VECTOR (0 downto 0) := "1";   -- uno stato
+
+if ((... loop non finito ...) and (ap_block_pp0_stage0_11001 = false)
+    and (ap_start_int = '1') and (ap_CS_fsm_pp0_stage0 = '1')) then
+    s_axis_TREADY_int_regslice <= '1';
+```
+
+### Lo sweep: forzare l'II e guardare cosa si compra
+
+Sette varianti in scratchpad (ricetta di `docs/02` §8), tutte sul sorgente del
+1.4 e con la direttiva nel `cfg`; cosim sulle tre che cambiano ritmo, per
+misurare il throughput sull'RTL invece di leggerlo nel report.
+
+| | Direttiva | Est. | DSP | FF | LUT | II | Iter. lat. | Stati FSM | Pipelined |
+|---|---|---|---|---|---|---|---|---|---|
+| 1.4 = 1.5 | *(nessuna / `II=1`)* | 2,238 | 4 | 298 | 343 | 1 | 4 | 1 | sì |
+| E2 | `II=2` | 2,330 | 4 | 242 | 302 | 2 | 4 | 2 | sì |
+| E3 | `II=4` | 2,330 | 4 | 236 | 317 | 4 | 4 | 4 | sì |
+| E4 | `off=1` | 2,330 | 4 | 236 | 283 | – | 3 | 4 | **no** |
+| E5 | `ALLOCATION mul limit=1` | 2,238 | 4 | 298 | 343 | 1 | 4 | 1 | sì |
+
+E la cosim, sugli stessi tre pacchetti del testbench:
+
+| | 1 campione | 8 campioni | 17 campioni | cicli per campione | tutto il testbench |
+|---|---|---|---|---|---|
+| 1.4 = 1.5 | 5 | 12 | 21 | **1** (N + 4) | 201 |
+| E2 `II=2` | 5 | 19 | 37 | **2** (2N + 3) | 254 |
+| E3 `II=4` | 6 | 34 | 70 | **4** (4N + 2) | 369 |
+| E4 `off` | 6 | 27 | 54 | **3** (3N + 3) | 316 |
+
+Quattro osservazioni.
+
+**a) I DSP non si muovono: 4 in tutte le varianti.** E non è un'approssimazione
+del report — la riga *Instance* (banco registri + moltiplicatore + regslice) è
+**identica** ovunque, 4 DSP / 158 FF / 210 LUT, e il modulo del moltiplicatore è
+sempre `mul_32s_32s_32_2_1`. Era la previsione scritta prima di sintetizzare:
+un II più alto serve a far usare *a turno* lo stesso operatore a più operazioni
+della stessa iterazione, e qui di moltiplicazione ce n'è **una**. Non c'è niente
+da mettere a turno.
+
+**b) Quello che si risparmia sono i registri di pipeline.** Tutto il calo di
+FF sta nella riga *Register*: 140 → 84 (II=2) → 78 (II=4 e off). Sono i registri
+che tengono i campioni "in volo" fra uno stadio e l'altro: con II=2 ce ne sono
+la metà in volo, quindi metà dei registri. È l'unico hardware che un II più alto
+compra su questo loop — 56 FF su 298 — e lo paga con metà del throughput.
+
+**c) L'II=2 nel VHDL è il contatore di fase.** La pipeline ha ora **due stati**,
+e `TREADY` si alza solo nel secondo:
+
+```vhdl
+constant ap_ST_fsm_pp0_stage0 : STD_LOGIC_VECTOR (1 downto 0) := "01";
+constant ap_ST_fsm_pp0_stage1 : STD_LOGIC_VECTOR (1 downto 0) := "10";
+
+if ((ap_enable_reg_pp0_iter0_reg = '1') and ... and (ap_CS_fsm_pp0_stage1 = '1')) then
+    s_axis_TREADY_int_regslice <= '1';
+```
+
+È letteralmente il `ready <= '1' when fase = 1 else '0';` che in VHDL
+scriveresti a mano: il modulo dice "aspetta" a monte un ciclo sì e uno no.
+Backpressure che il blocco si impone da solo, senza che a valle ci sia nessuno
+a chiederla. Con `II=4` gli stati diventano quattro, `TREADY` in uno solo.
+
+**d) `off=1` è il loop scritto come lo scriveresti in VHDL** — e non è la
+variante più lenta. Con il pipeline spento sparisce il modulo
+`axis_scaler_flow_control_loop_pipe.vhd` e al suo posto c'è una FSM classica a
+quattro stati:
+
+```text
+state1  aspetta ap_start
+state2  legge   (s_axis_TREADY alto solo qui); se era l'ultimo -> state1
+state3  scrive  (m_axis_TVALID alto, aspetta m_axis_TREADY)
+state4  aspetta il completamento della scrittura       -> state2
+```
+
+Un campione per giro, tre cicli per giro, **nessuna sovrapposizione**: mentre
+il campione *n* è in `state3`, nessun *n+1* viene letto. È il process con il
+`case` che chiunque venga dal VHDL avrebbe scritto per primo — e costa 3 cicli
+per campione, cioè **meno di `II=4`**. Vale la pena fissarlo: *pipelinare con
+un II forzato può essere più lento di non pipelinare affatto*, perché un loop
+sequenziale paga la sua iteration latency (qui 3) e basta, mentre `II=4` paga
+4 per definizione.
+
+Una nota sul timing: tutte le varianti forzate stimano 2,330 ns invece di
+2,238, con lo stesso moltiplicatore. Il percorso critico si è spostato nella
+logica di controllo; il report di sintesi non dice dove, e non inventiamo una
+spiegazione.
+
+### Le due leve a confronto: `PIPELINE II=N` e `ALLOCATION`
+
+`docs/05` §3 aveva misurato `ALLOCATION` su un FIR con 8 moltiplicazioni per
+iterazione: 16 DSP invece di 32, II=2. Qui E5 (`ALLOCATION ... instances=mul
+limit=1`) ha prodotto un build **identico** al riferimento — nel log:
+`Target II = NA, Final II = 1`. Con una moltiplicazione sola, un limite di una
+istanza non limita niente.
+
+| | `PIPELINE II=N` | `ALLOCATION limit=N` |
+|---|---|---|
+| Cosa vincola | il **ritmo**: un campione ogni N cicli | il **budget**: al più N istanze di un operatore |
+| Cosa lascia decidere al tool | quante istanze usare per rispettare il ritmo | quale II serve per rispettare il budget |
+| Su un loop con 8 moltiplicazioni (`docs/05` §3) | II=2 → 16 DSP, ma glielo hai detto tu | limit=4 → 16 DSP e II=2, **dedotto** dal tool |
+| Su `axis_scaler`, una moltiplicazione | throughput /N, DSP invariati | nessun effetto |
+
+La regola vale per entrambe: **si può ripiegare solo quello che c'è in
+eccesso**. Se un'iterazione contiene una sola operazione di un tipo, nessuna
+delle due leve tocca quell'operatore. Fra le due, `ALLOCATION` è quella che
+esprime l'intenzione giusta quando l'obiettivo sono le risorse — dici quanti
+DSP vuoi pagare e il tool trova l'II minimo — mentre `PIPELINE II=N` esprime un
+vincolo di ritmo, e forzarlo per risparmiare area è la leva sbagliata: si
+perde throughput con certezza, si guadagna area solo se c'era qualcosa da
+condividere.
+
+Su `axis_scaler` la leva che compra DSP non è nessuna delle due: è la
+**larghezza degli operandi** (`docs/05` §6, 32×32 = 4 DSP contro 16×16 = 1). È
+il gradino 1.6.
+
+### Perché la riga resta, se non cambia niente: due esperimenti
+
+L'argomento che circola è *"col pragma il tool ti avvisa se non riesce a
+rispettare l'II"*. Sintetizzata una variante in cui II=1 è impossibile (due
+`.write()` sullo stesso stream per iterazione), con e senza pragma:
+
+```text
+WARNING: [HLS 200-880] The II Violation in module 'axis_scaler' (loop
+'copia_pacchetto'): Unable to enforce a carried dependence constraint (II = 1,
+distance = 1, offset = 1) between axis write operation ... and axis write
+operation ... on port 'm_axis_V_data_V'
+```
+
+**Lo stesso warning in entrambi i casi**, stesso VHDL, stesso report (`II
+achieved 2, target 1`). L'argomento è falso: il tool avvisa comunque.
+
+L'argomento vero è un altro, ed è questo:
+
+| | `syn.compile.pipeline_loops=0` nel cfg | Risultato |
+|---|---|---|
+| sorgente 1.4, senza pragma | auto-pipeline spento | loop **non pipelinato**: 3 cicli per campione, 4 stati, 236 FF / 283 LUT — **nessun warning** |
+| sorgente 1.5, con pragma | auto-pipeline spento | II=1, identico al 1.5 |
+
+Una riga in `hls_config.cfg` — un file di configurazione, che nessuno legge con
+l'attenzione con cui si legge il sorgente — trasforma la IP del 1.4 in una IP
+tre volte più lenta, in silenzio. Con il pragma nel `.cpp` il ritmo è blindato.
+"Un campione per clock" è la *specifica* di questa IP, e va scritta dove si
+legge il codice: un vincolo dichiarato si vede, un default si eredita.
+
+### Il testbench: non cambia, e il motivo è il punto del gradino
+
+Il pragma non tocca né la firma né il valore calcolato: cambia (o qui conferma)
+il *ritmo* con cui l'hardware accetta i campioni. E il ritmo è esattamente la
+cosa che la C simulation non vede — non ha clock, `hls::stream` è una coda
+infinita, e un loop a II=1 o a II=4 produce gli stessi numeri nello stesso
+ordine. Infatti `make csim` è passato identico sulle sette varianti; è la
+**cosim** che ha distinto 1 da 2, 3 e 4 cicli per campione. Il file è lo
+stesso: stesso `main()`, stesso `return`, riapplicato all'RTL nel simulatore.

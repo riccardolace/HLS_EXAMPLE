@@ -188,6 +188,21 @@ entity e il report del gradino corrente. Senza il "prima" non esiste il
 confronto, e il confronto è il punto di tutto il metodo. Questo progetto lo fa in
 `/tmp`, ma va bene qualunque posto.
 
+**Attenzione ai numeri di riga nei nomi.** HLS incorpora la riga del sorgente
+nei nomi dei segnali (`phi_ln203_reg_123` = il `while` alla riga 203). Basta
+spostare un commento perché decine di segnali cambino nome senza che cambi un
+filo — è successo al gradino 1.5, con 86 righe di diff su un RTL identico. Per
+confrontare due build del top:
+
+```bash
+diff <(sed -E 's/ln[0-9]+/lnX/g' prima/axis_scaler.vhd) \
+     <(sed -E 's/ln[0-9]+/lnX/g' dopo/axis_scaler.vhd)
+```
+
+I sotto-moduli (`_ctrl_s_axi`, `_mul_*`, `_regslice_*`) non hanno questo
+problema e si confrontano con `diff` o `cmp` direttamente. Nella GUI, *Compare
+With* non normalizza: leggi il diff sapendo che `lnNNN` non è una differenza.
+
 ### Una asimmetria utile da conoscere
 
 Con `flow_target=vivado`, **`make csynth` esegue anche il packaging dell'IP**. Nel
@@ -249,6 +264,25 @@ Nota che **manca `tb.file`**: per la sola sintesi non serve un testbench, e
 ometterlo rende l'esperimento più rapido da montare. Ovviamente questo vale solo
 per gli esperimenti: nel progetto vero la regola resta *non si sintetizza finché
 `make csim` non è verde*.
+
+**Variante senza toccare il sorgente.** Se la cosa da provare è un pragma di
+ottimizzazione (`PIPELINE`, `UNROLL`, `ALLOCATION`…), non serve nemmeno
+modificare il `.cpp`: la direttiva si scrive nel `cfg`, nella stessa forma che
+la GUI produce scegliendo *Config file* come destinazione nel pannello
+*HLS DIRECTIVES*:
+
+```ini
+syn.directive.pipeline=axis_scaler/copia_pacchetto II=2
+syn.directive.allocation=axis_scaler/copia_pacchetto instances=mul limit=1 type=operation
+```
+
+Così lo sweep del gradino 1.5 è stato sette cartelle con lo **stesso**
+sorgente e sette `cfg` che differiscono per una riga — e il "prima" è
+garantito identico per costruzione. Se invece la variante deve girare in
+**cosim** (per misurare i cicli, non solo leggerli nel report), servono anche
+`tb.file` e `tb.cflags` con percorsi assoluti, e poi
+`vitis-run --mode hls --cosim --config hls_config.cfg --work_dir prova`:
+circa un minuto per componente.
 
 Poi:
 

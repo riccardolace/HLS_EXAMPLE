@@ -2,27 +2,23 @@
 //  axis_scaler.cpp  --  Implementazione della top function
 // =============================================================================
 //
-//  GRADINO 1.4  --  IL PRIMO REGISTRO DI STATO
+//  GRADINO 1.5  --  IL CONTROLLO ESPLICITO DEL PIPELINE
 //
-//  Fino al gradino 1.3 l'informazione viaggiava in una direzione sola:
+//  Fino al gradino 1.4 ogni riga aggiunta faceva comparire qualcosa nell'RTL:
+//  porte, registri, un moltiplicatore, un bit di validita'. Questo gradino e'
+//  diverso, e lo e' di proposito: aggiungiamo UNA riga
 //
-//        software  --(gain)-->  hardware  --(campioni)-->  stream
+//        #pragma HLS PIPELINE II=1
 //
-//  Il software poteva dire alla IP cosa fare, ma la IP non poteva dire niente
-//  al software se non attraverso lo stream dei dati. L'unica cosa che il
-//  processore sapeva era "ho finito" (il bit ap_done).
+//  e l'RTL generato NON CAMBIA. Non e' un esperimento fallito: e' la conferma
+//  di una cosa scoperta al gradino 1.1, cioe' che il tool mette in pipeline i
+//  loop da solo. Il pragma dichiara per iscritto il ritmo che vogliamo -- un
+//  campione per colpo di clock -- invece di lasciarlo a un default.
 //
-//  Ora apriamo il canale di ritorno: un registro che l'hardware SCRIVE e il
-//  software LEGGE. Contiamo quanti campioni aveva il pacchetto appena
-//  elaborato -- cioe' quanti beat sono passati prima del TLAST.
-//
-//  Tre modifiche, che sono tre facce della stessa cosa:
-//    1. un argomento nuovo, e stavolta e' un PUNTATORE   (int *sample_count)
-//    2. il solito pragma che lo mappa nel banco registri
-//    3. un contatore nel loop, e UNA scrittura dopo il loop
-//
-//  Obiettivo del gradino: guardare cosa compare nella mappa registri accanto
-//  al valore, e capire quando quel valore viene aggiornato.
+//  Obiettivo del gradino: capire cosa sono davvero "II" e "iteration latency"
+//  guardando cosa succede all'hardware quando l'II lo FORZIAMO a 2 e a 4, e
+//  quando il pipeline lo spegniamo. Quegli esperimenti stanno in scratchpad,
+//  i risultati in docs/00 par. 8. Qui in src/ resta solo la riga permanente.
 //
 // =============================================================================
 #include "axis_scaler.hpp"
@@ -93,62 +89,22 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
     //
 #pragma HLS INTERFACE mode=s_axilite port=gain bundle=ctrl
 
-    // =========================================================================
-    //  LA MODIFICA DEL GRADINO 1.4
-    // =========================================================================
+    // --- Il registro di stato (gradino 1.4) ----------------------------------
     //
-    //  --- Il primo registro di stato -----------------------------------------
-    //
-    //  La riga e' identica a quella di gain. Cambia una cosa sola, e non sta
-    //  nel pragma: sta nella firma della funzione, dove sample_count e' un
-    //  PUNTATORE. E' da li' che il tool capisce che questa e' un'uscita.
+    //  Stessa riga di gain, ma nella firma sample_count e' un PUNTATORE: e' da
+    //  li' -- non dal pragma -- che il tool capisce che e' un'uscita.
     //
     //        stesso pragma + argomento per valore     -> registro scrivibile
     //        stesso pragma + argomento per puntatore  -> registro leggibile
     //
-    //  COSA PRODUCE FISICAMENTE, rispetto a gain:
+    //  Produce, dentro axis_scaler_ctrl_s_axi.vhd, un registro a 32 bit
+    //  caricato dal DATAPATH (a 0x18, Read) e un bit di validita'
+    //  sample_count_ap_vld (a 0x1c, Read/COR) nello slot che per gain era
+    //  "reserved": un latch acceso da un impulso dell'hardware e spento
+    //  dalla lettura del software, lo stesso idioma di ap_done. E' il TVALID
+    //  di AXI4-Stream applicato a un registro. Dettagli in docs/00 par. 7.
     //
-    //   1) un registro a 32 bit dentro axis_scaler_ctrl_s_axi.vhd, ma con la
-    //      logica ROVESCIATA: gain veniva caricato dal canale di scrittura
-    //      AXI (WDATA) e letto dal datapath; sample_count viene caricato dal
-    //      DATAPATH e letto dal canale di lettura AXI (RDATA);
-    //
-    //   2) un filo interno che va dalla logica di calcolo al banco registri --
-    //      direzione opposta a quella di gain;
-    //
-    //   3) qualcosa in piu', che con gain non c'era: un segnale di VALIDITA'
-    //      che accompagna il dato. E' la cosa da cercare nell'RTL generato.
-    //
-    //  --------------------------------------------------------------------
-    //  IL PEZZO DA CERCARE DOPO LA SINTESI: lo slot "_CTRL"
-    //  --------------------------------------------------------------------
-    //  Al gradino 1.3, nell'header generato, avevamo notato una riga strana:
-    //
-    //        0x10 : Data signal of gain
-    //        0x14 : reserved            <-- inutilizzato
-    //
-    //  HLS riserva a OGNI registro utente una coppia di slot: uno per il dato
-    //  e uno di servizio (nel VHDL si chiamano ADDR_<nome>_DATA_0 e
-    //  ADDR_<nome>_CTRL). Per un ingresso come gain il secondo non serve a
-    //  niente e resta "reserved".
-    //
-    //  Per un'uscita invece serve, e la ragione e' un problema che in VHDL
-    //  avresti dovuto risolvere a mano:
-    //
-    //        il software legge quel registro quando vuole, anche PRIMA che
-    //        l'hardware ci abbia mai scritto dentro. Cosa trova? E come fa a
-    //        sapere se quello che ha letto e' un valore vero o spazzatura
-    //        rimasta dall'accensione?
-    //
-    //  La risposta di AMD e' un bit di accompagnamento, "<nome>_ap_vld": lo
-    //  alza l'hardware quando deposita un valore nuovo, e dice al software
-    //  "quello che c'e' nel registro dato e' roba fresca". Lo vedremo comparire
-    //  proprio nello slot che per gain era "reserved".
-    //
-    //  E' lo stesso concetto del TVALID di AXI4-Stream, applicato a un
-    //  registro invece che a un bus: un dato senza un valido che lo accompagni
-    //  e' un dato di cui non sai niente.
-    //  --------------------------------------------------------------------
+    //  INVARIATO dal gradino 1.4.
     //
 #pragma HLS INTERFACE mode=s_axilite port=sample_count bundle=ctrl
 
@@ -201,6 +157,69 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
     // -------------------------------------------------------------------------
     copia_pacchetto:
     while (!ultimo) {
+
+        // =====================================================================
+        //  LA MODIFICA DEL GRADINO 1.5: il pipeline dichiarato per iscritto
+        // =====================================================================
+        //
+        //  Il pragma sta DENTRO il corpo del loop, non prima dell'etichetta:
+        //  e' la sintassi di HLS, e si applica al loop che lo contiene. E' la
+        //  prima cosa che sorprende venendo dal VHDL.
+        //
+        //  COSA PRODUCE FISICAMENTE: NIENTE DI NUOVO. L'RTL e' identico a
+        //  quello del gradino 1.4, byte per byte (verificato con il diff del
+        //  VHDL, docs/00 par. 8): dalla versione 2020.2 il tool pipelina da
+        //  solo i loop, e questo lo aveva gia' fatto. Lo confessa lui stesso
+        //  in syn/inferred_directives.ini del build 1.4:
+        //
+        //        # Inferred from syn.compile.pipeline_loops=64
+        //        syn.directive.pipeline=axis_scaler/copia_pacchetto
+        //
+        //  I DUE NUMERI DEL REPORT, che si confondono facilmente:
+        //
+        //    Iteration Latency = 4   quanti cicli impiega UN campione ad
+        //                            attraversare il corpo del loop: il
+        //                            moltiplicatore 32x32 non sta in 4 ns e
+        //                            il tool lo ha spezzato in 4 stadi.
+        //
+        //    II = 1                  ogni quanti cicli PUO' ENTRARE un campione
+        //    (Initiation Interval)   NUOVO. Non aspetta che il precedente sia
+        //                            uscito: fino a 4 campioni "in volo"
+        //                            insieme, uno per stadio. Una catena di
+        //                            montaggio, non uno sportello.
+        //
+        //  In termini di fili: II=1 vuol dire che s_axis_TREADY puo' stare
+        //  alto a OGNI colpo di clock. Con II=2 il modulo lo alzerebbe un
+        //  ciclo si' e uno no -- backpressure che si impone da solo, meta' del
+        //  throughput. In VHDL sarebbe il contatore di fase di un datapath
+        //  condiviso,  ready <= '1' when fase = 0 else '0';  con i mux sugli
+        //  operandi scritti a mano. Qui li genera lo scheduler.
+        //
+        //  A cosa serve, allora, un II piu' alto? A CONDIVIDERE hardware: con
+        //  II=2 due operazioni dello stesso tipo nella stessa iterazione
+        //  possono usare a turno lo stesso operatore fisico (docs/05 par. 3,
+        //  il FIR con 8 moltiplicazioni su 4 DSP). Ma qui di moltiplicazione
+        //  ce n'e' UNA per iterazione: non c'e' niente da mettere a turno.
+        //  Misurato (docs/00 par. 8): con II=2 i DSP restano 4 e il
+        //  moltiplicatore e' lo stesso modulo; spariscono solo 56 FF di
+        //  registri di pipeline, in cambio di meta' del throughput.
+        //
+        //  PERCHE' LA RIGA RESTA, se non cambia niente: perche' "un campione
+        //  per clock" e' la SPECIFICA di questa IP, e va scritta dove si legge
+        //  il codice, non lasciata a un default (pipeline_loops=64) che
+        //  chiunque puo' cambiare in hls_config.cfg senza toccare il sorgente.
+        //  Verificato: con  syn.compile.pipeline_loops=0  nel cfg, il sorgente
+        //  del 1.4 sintetizza un loop NON pipelinato -- 3 cicli per campione,
+        //  4 stati di FSM -- senza un solo warning. Con questa riga resta
+        //  II=1. Un vincolo dichiarato si vede; un default si eredita.
+        //
+        //  Nella GUI: pannello HLS DIRECTIVES, cursore sul loop, "+", PIPELINE,
+        //  II=1. Destinazione "Source file" scrive questa riga; "Config file"
+        //  scrive invece in hls_config.cfg la forma equivalente
+        //        syn.directive.pipeline=axis_scaler/copia_pacchetto II=1
+        //  che e' quella usata per lo sweep in scratchpad.
+        // ---------------------------------------------------------------------
+#pragma HLS PIPELINE II=1
 
         // --- LETTURA BLOCCANTE ------------------------------------------------
         //
@@ -283,19 +302,10 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
     //  n'e' mai stata una. Ed e' esattamente il caso in cui serve il bit
     //  _ap_vld di cui sopra.
     //
-    //  --------------------------------------------------------------------
-    //  E SE L'AVESSIMO MESSA DENTRO IL LOOP?
-    //  --------------------------------------------------------------------
-    //  Scrivere  *sample_count = conteggio;  a ogni iterazione sarebbe C
-    //  perfettamente valido, e il risultato finale sarebbe lo stesso. Ma
-    //  chiederebbe al tool di aggiornare il registro a ogni beat, cioe' di
-    //  tenere un percorso verso il banco registri attivo per tutta la durata
-    //  del pacchetto invece che per un ciclo solo.
-    //
-    //  Non ci limitiamo a immaginarlo: e' una delle cose che guardiamo in
-    //  questo gradino, sintetizzando la variante in scratchpad e confrontando
-    //  il VHDL. Il risultato sta in docs/00.
-    //  --------------------------------------------------------------------
+    //  Scriverla DENTRO il loop sarebbe C valido e darebbe lo stesso numero,
+    //  ma _ap_vld pulserebbe a ogni beat e smetterebbe di significare "il
+    //  risultato e' pronto". Verificato in scratchpad al gradino 1.4 (docs/00
+    //  par. 7, esperimento A): la ragione e' semantica, non di risorse.
     // -------------------------------------------------------------------------
     *sample_count = conteggio;
 }
@@ -305,22 +315,24 @@ void axis_scaler(hls::stream<pkt_t> &s_axis,
 //  COSA GUARDARE DOPO AVER SINTETIZZATO QUESTO FILE
 // =============================================================================
 //
-//  1) L'header generato xaxis_scaler_hw.h. Ci aspettiamo due righe nuove: il
-//     dato a 0x18, e -- questa e' la novita' -- lo slot successivo NON piu'
-//     "reserved", ma occupato da un bit di validita'. Con quale sigla di
-//     accesso e' documentato? (COR? Il vocabolario del gradino 1.2 serve qui.)
+//  Stavolta la lista e' di cose che NON devono cambiare, piu' una.
 //
-//  2) axis_scaler_ctrl_s_axi.vhd: la logica di gain era un ramo del processo
-//     di SCRITTURA (w_hs, wmask). Per sample_count deve esserci qualcosa nel
-//     processo di LETTURA, piu' un ramo che cattura il valore dal datapath.
+//  1) diff del VHDL contro il build 1.4 congelato: zero righe. Se compare
+//     una differenza, il pragma ha fatto qualcosa che non avevamo previsto.
 //
-//  3) La entity axis_scaler. Al gradino 1.3 C_S_AXI_CTRL_ADDR_WIDTH era
-//     passato da 4 a 5 bit (32 byte). Ora occupiamo 0x18 e 0x1C: siamo ancora
-//     dentro i 32 byte, oppure serve un altro bit? Conto prima, verifica dopo.
+//  2) Il report: stessi 4 DSP / 298 FF / 343 LUT, stesso Estimated 2,238 ns,
+//     e nella tabella dei loop  II achieved = 1, target = 1, Pipelined = yes.
+//     La colonna "target" c'era gia' al 1.4 con lo stesso valore: il default
+//     e il pragma chiedono la stessa cosa.
 //
-//  4) Il report: un sommatore a 32 bit in piu' e un registro in piu' nel banco.
-//     L'II e' rimasto 1?
+//  3) syn/inferred_directives.ini: al 1.4 elencava il pipeline come dedotto
+//     ("Inferred from syn.compile.pipeline_loops=64"). Ora che lo dichiariamo
+//     noi, quella riga deve sparire. E' l'unica traccia della modifica.
 //
-//  Nel GRADINO 1.5 metteremo mano al PIPELINE in modo esplicito e guarderemo
-//  cosa cambia davvero in II, latenza e throughput.
+//  4) La cosim (C/RTL COSIMULATION > Run): la tabella delle transazioni in
+//     sim/report/verilog/result.transaction.rpt deve coincidere al ciclo con
+//     quella del 1.4. E' la conferma fatta dove conta, sull'RTL in esecuzione.
+//
+//  Nel GRADINO 1.6 gain diventa ap_fixed<16,2>: la previsione, da docs/05
+//  par. 6, e' che i DSP scendano da 4 a 1. Da scrivere PRIMA di sintetizzare.
 // =============================================================================

@@ -2,26 +2,20 @@
 //  axis_scaler.hpp  --  Tipi e dichiarazione dell'IP
 // =============================================================================
 //
-//  GRADINO 1.4 della costruzione incrementale.
+//  GRADINO 1.5 della costruzione incrementale.
 //
-//  LA NOVITA': il primo registro di STATO.
+//  QUESTO FILE NON CAMBIA, ed e' un fatto da notare. Il gradino aggiunge
+//  #pragma HLS PIPELINE nel .cpp, e un pragma di pipeline riguarda COME viene
+//  schedulato un loop, non COSA il modulo espone al mondo. La firma della
+//  funzione -- cioe' la entity -- e' la stessa del gradino 1.4. Vale la
+//  regola: i pragma di INTERFACE cambiano le porte, i pragma di ottimizzazione
+//  (PIPELINE, UNROLL, ALLOCATION...) cambiano solo quello che sta dentro.
 //
-//  Al gradino 1.3 abbiamo aggiunto "gain": un registro che il SOFTWARE scrive e
-//  l'HARDWARE legge. Ora facciamo il viaggio opposto:
-//
-//        un registro che l'HARDWARE scrive e il SOFTWARE legge
-//
-//  Contiamo quanti campioni aveva il pacchetto appena elaborato, e lo rendiamo
-//  leggibile dal bus. E' la prima informazione che esce dalla IP senza passare
-//  dallo stream.
-//
-//  La riga che cambia e' una sola, e sta nel prototipo qui sotto:
+//  Il prototipo qui sotto e' quindi ancora quello del 1.4, con i suoi due
+//  argomenti scalari in direzioni opposte:
 //
 //        int  gain          ->  ingresso,  si passa PER VALORE
 //        int *sample_count  ->  uscita,    si passa PER PUNTATORE
-//
-//  Obiettivo del gradino: capire perche' quell'asterisco e' obbligatorio, e
-//  scoprire cosa compare nella mappa registri accanto al valore.
 //
 // =============================================================================
 #ifndef AXIS_SCALER_HPP
@@ -125,10 +119,10 @@ typedef ap_axis<C_DATA_WIDTH, 0, 0, 0> pkt_t;
 //  infatti la sintesi si rifiuterebbe.
 //
 //  --------------------------------------------------------------------------
-//  IL NUOVO ARGOMENTO: sample_count -- e perche' ha un asterisco
+//  L'ARGOMENTO sample_count (gradino 1.4) -- e perche' ha un asterisco
 //  --------------------------------------------------------------------------
 //
-//  Al gradino 1.3 avevamo anticipato la regola, ora la usiamo:
+//  Al gradino 1.3 avevamo anticipato la regola, al 1.4 l'abbiamo usata:
 //
 //        per VALORE     (int gain)          -> il tool lo puo' solo LEGGERE
 //                                              => registro di sola scrittura

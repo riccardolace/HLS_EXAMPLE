@@ -2,15 +2,27 @@
 //  axis_scaler_tb.cpp  --  Testbench auto-verificante
 // =============================================================================
 //
-//  GRADINO 1.4
+//  GRADINO 1.5
 //
-//  LA NOVITA': il testbench deve verificare anche quello che la IP dice di se'
-//  stessa, non solo i dati che produce.
+//  IL TESTBENCH NON CAMBIA. Il gradino aggiunge #pragma HLS PIPELINE II=1 al
+//  loop del DUT, e un pragma di pipeline non tocca ne' la firma della
+//  funzione ne' il valore che produce: cambia (o, qui, conferma) il RITMO con
+//  cui l'hardware accetta i campioni. E il ritmo e' esattamente la cosa che
+//  la C simulation non vede -- non ha clock. Qui hls::stream e' una coda
+//  infinita, e un loop con II=1 o II=4 produce gli stessi numeri nello
+//  stesso ordine.
 //
-//  Fino al 1.3 controllavamo tre cose: i valori in uscita, TLAST, e il numero
-//  di beat. Tutte e tre viaggiavano sullo stream. Ora la IP scrive un REGISTRO
-//  DI STATO, e quel registro e' un'uscita a tutti gli effetti: se contiene un
-//  numero sbagliato, la IP e' rotta anche se lo stream e' perfetto.
+//  Chi lo vede, invece, e' la cosimulation: e' li' che l'II diventa cicli di
+//  clock misurati per transazione. Stesso file, stesso main(), stesso return
+//  -- ma riapplicato all'RTL nel simulatore. E' il motivo per cui il file
+//  deve restare auto-verificante (vedi sotto).
+//
+//  Dal gradino 1.4: il testbench verifica anche quello che la IP dice di se'
+//  stessa, non solo i dati che produce. Fino al 1.3 controllavamo tre cose --
+//  i valori in uscita, TLAST, e il numero di beat -- e tutte e tre
+//  viaggiavano sullo stream. Dal 1.4 la IP scrive un REGISTRO DI STATO, e
+//  quel registro e' un'uscita a tutti gli effetti: se contiene un numero
+//  sbagliato, la IP e' rotta anche se lo stream e' perfetto.
 //
 //  --------------------------------------------------------------------------
 //  UNA USCITA NON VERIFICATA E' UNA USCITA CHE NON ESISTE
@@ -336,7 +348,7 @@ static int prova_pacchetto(int n_campioni, int gain, const char *descrizione)
 int main()
 {
     printf("=====================================================\n");
-    printf(" axis_scaler -- testbench gradino 1.4 (registro di stato)\n");
+    printf(" axis_scaler -- testbench gradino 1.5 (pipeline esplicito)\n");
     printf("=====================================================\n");
 
     int errori = 0;
